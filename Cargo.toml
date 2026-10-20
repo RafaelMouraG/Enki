@@ -1,0 +1,40 @@
+[package]
+name = "enki"
+version = "0.1.0"
+edition = "2021"
+description = "A focused pomodoro timer for macOS and Linux"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+dirs = "6.0"
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+gpui = "0.2.2"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+unicode-segmentation = "1.12"
+ureq = "3"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Compile Metal shaders at runtime so building doesn't need Xcode's Metal toolchain.
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+# Liquid Glass views and trackpad haptics (see src/native.rs).
+objc = "0.2"
+raw-window-handle = "0.6"
+tray-icon = { version = "0.21", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# gpui 0.2.2 pulls xattr 0.2.3 (via its http client), which needs `libc::ENOATTR`;
+# libc 0.2.190 removed it on Linux. Drop this pin once gpui moves on.
+libc = "=0.2.189"
+ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
+notify-rust = { version = "4", default-features = false, features = ["z"] }
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+
+# Dependencies (image decoding especially) are painfully slow unoptimized.
+[profile.dev.package."*"]
+opt-level = 2

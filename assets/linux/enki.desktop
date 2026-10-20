@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Enki
+GenericName=Pomodoro
+Comment=Timer pomodoro com tarefas e estatísticas
+Exec=enki
+Icon=enki
+Terminal=false
+Categories=Utility;Office;
+Keywords=pomodoro;timer;foco;focus;tarefas;
+StartupWMClass=enki

@@ -14,7 +14,7 @@ use crate::{
     theme::{clock_font, radius, Theme, UI_FONT},
     ui::{
         components::StyledExt as _,
-        components::{glass, icon_button, icon_sized},
+        components::{glass, icon_button, icon_sized, WindowDrag},
         on_model,
         ring::ring,
     },
@@ -22,6 +22,7 @@ use crate::{
 
 pub struct MiniView {
     model: Entity<Enki>,
+    drag: WindowDrag,
     _subscription: Subscription,
 }
 
@@ -30,6 +31,7 @@ impl MiniView {
         let subscription = cx.observe(&model, |_, _, cx| cx.notify());
         Self {
             model,
+            drag: WindowDrag::default(),
             _subscription: subscription,
         }
     }
@@ -103,9 +105,7 @@ impl Render for MiniView {
             })
             .rounded(radius::LG)
             .window_control_area(WindowControlArea::Drag)
-            .when(client_decorated, |d| {
-                d.on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
-            })
+            .when(client_decorated, |d| self.drag.attach(d))
             .child(toggle)
             .child(
                 div()

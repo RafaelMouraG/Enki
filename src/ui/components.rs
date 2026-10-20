@@ -41,6 +41,36 @@ impl<T: Styled + ParentElement> SurfaceExt for T {}
 
 pub type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
+/// Moves a client-decorated window when its title area is dragged. The move
+/// starts once the pointer travels a few pixels with the button held, not on
+/// the press: on Wayland the compositor grabs the pointer for the move, which
+/// would swallow clicks on the buttons inside the area. Keep one per view so
+/// the press survives re-renders.
+#[derive(Clone, Default)]
+pub struct WindowDrag(Rc<std::cell::Cell<Option<gpui::Point<Pixels>>>>);
+
+impl WindowDrag {
+    const THRESHOLD: Pixels = px(4.);
+
+    pub fn attach<E: InteractiveElement>(&self, area: E) -> E {
+        let (press, origin) = (self.0.clone(), self.0.clone());
+        area.on_mouse_down(MouseButton::Left, move |event, _, _| {
+            press.set(Some(event.position))
+        })
+        .on_mouse_move(move |event: &MouseMoveEvent, window, _| {
+            let Some(start) = origin.get() else { return };
+            if event.pressed_button != Some(MouseButton::Left) {
+                origin.set(None);
+            } else if (event.position.x - start.x).abs() > Self::THRESHOLD
+                || (event.position.y - start.y).abs() > Self::THRESHOLD
+            {
+                origin.set(None);
+                window.start_window_move();
+            }
+        })
+    }
+}
+
 /// The backing of a glass surface. Put it first inside a `relative` container
 /// with the same corner radius. With native glass it places a Liquid Glass
 /// view under the container; otherwise it draws a translucent fill and a rim.

@@ -17,7 +17,7 @@ Um timer pomodoro para macOS e Ubuntu, escrito em Rust com [GPUI](https://gpui.r
 - **Estatísticas**: foco de hoje, sequência de dias, recorde, últimos 7 dias e um heatmap dos últimos 6 meses.
 - **Barra de menus (macOS) / bandeja (Ubuntu)** com o tempo restante e atalhos para iniciar, pausar, pular e reiniciar.
 - **Modo mini**: janela pequena que flutua sobre as outras.
-- **Música tocando agora**: mostra e controla o Spotify na barra lateral, sem login e funcionando com conta grátis. No macOS usa AppleScript; no Linux, MPRIS (Spotify ou qualquer player).
+- **Música tocando agora**: mostra e controla o Spotify abaixo do timer (e na barra lateral nas outras páginas), sem login e funcionando com conta grátis. No macOS usa AppleScript; no Linux, MPRIS (Spotify ou qualquer player).
 - **Aparência**: sistema/claro/escuro, 7 cores de destaque, imagem de fundo com desfoque, e "usar cores do papel de parede" (o destaque e um leve tom das superfícies vêm da imagem).
 - **Vidro líquido**: no macOS 26 ou mais novo, a barra lateral flutuante, os cartões e os controles do timer usam o Liquid Glass do sistema (`NSGlassEffectView`), que refrata a imagem de fundo. No Ubuntu e em macOS mais antigos o vidro é desenhado pelo app: superfícies translúcidas com borda iluminada.
 - **Feedback tátil**: no trackpad Force Touch do Mac, os botões do timer, o seletor de fase e os interruptores dão um toque, e os sliders das configurações "travam" em cada posição com um clique sentido no dedo.

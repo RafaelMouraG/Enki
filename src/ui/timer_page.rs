@@ -1,4 +1,4 @@
-//! The main screen: phase switcher, ring, controls and the focus composer.
+//! The main screen: phase switcher, ring, controls and the music player.
 
 use std::time::{Duration, Instant};
 
@@ -15,14 +15,14 @@ use crate::{
     ui::{
         components::StyledExt as _,
         components::{glass, glass_styled, icon, icon_sized, segmented, SegmentOption},
-        format_minutes, on_model,
+        format_minutes, on_model, player,
         ring::{mini_ring, ring},
         root::RootView,
     },
 };
 
 const RING: f32 = 300.;
-const COMPOSER_RADIUS: gpui::Pixels = px(18.);
+const PLAYER_RADIUS: gpui::Pixels = px(18.);
 
 pub fn render(view: &mut RootView, _window: &mut Window, cx: &mut Context<RootView>) -> AnyElement {
     let model = view.model.clone();
@@ -183,9 +183,9 @@ pub fn render(view: &mut RootView, _window: &mut Window, cx: &mut Context<RootVi
                 .on_click(on_model(&model, |m, cx| m.skip_phase(cx))),
         );
 
-    // The composer pill, modeled on Zeron's "Do anything…" box.
+    // The current task and, when something is playing, the player.
     let current_task = enki.current_task_title().map(|t| t.to_string());
-    let composer = div()
+    let below = div()
         .flex()
         .flex_col()
         .w_full()
@@ -229,45 +229,36 @@ pub fn render(view: &mut RootView, _window: &mut Window, cx: &mut Context<RootVi
                 ),
             )
         })
-        .child(
-            div()
-                .relative()
-                .flex()
-                .items_center()
-                .gap(px(10.))
-                .h(px(52.))
-                .pl(px(16.))
-                .pr(px(8.))
-                .rounded(COMPOSER_RADIUS)
-                .map(|d| {
-                    if liquid {
-                        d.child(glass("composer", COMPOSER_RADIUS, theme))
-                    } else {
-                        d.bg(if has_wallpaper {
-                            with_alpha(theme.surface, 0.86)
+        .when_some(enki.now_playing.as_ref(), |d, np| {
+            // The glass goes first, under the row.
+            d.child(
+                div()
+                    .relative()
+                    .h(px(60.))
+                    .rounded(PLAYER_RADIUS)
+                    .map(|d| {
+                        if liquid {
+                            d.child(glass("player", PLAYER_RADIUS, theme))
                         } else {
-                            theme.surface
-                        })
-                        .border_1()
-                        .border_color(theme.border_strong)
-                        .shadow(theme.card_shadow())
-                    }
-                })
-                .text_size(px(15.))
-                .child(icon_sized(Icon::Sparkle, px(16.), theme.text_faint))
-                .child(view.intention_input.clone())
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .px(px(8.))
-                        .text_size(px(13.))
-                        .text_color(theme.text_muted)
-                        .child(icon_sized(Icon::Clock, px(13.), theme.text_faint))
-                        .child(format_minutes(timer.durations().of(phase).as_secs())),
-                ),
-        );
+                            d.bg(if has_wallpaper {
+                                with_alpha(theme.surface, 0.86)
+                            } else {
+                                theme.surface
+                            })
+                            .border_1()
+                            .border_color(theme.border_strong)
+                            .shadow(theme.card_shadow())
+                        }
+                    })
+                    .child(
+                        player::row(np, &model, theme, true)
+                            .relative()
+                            .size_full()
+                            .pl(px(8.))
+                            .pr(px(10.)),
+                    ),
+            )
+        });
 
     let stats = &enki.stats;
     let today = stats.today();
@@ -345,7 +336,7 @@ pub fn render(view: &mut RootView, _window: &mut Window, cx: &mut Context<RootVi
                 .child(ring_block)
                 .child(controls)
                 .child(div().h(px(8.)))
-                .child(composer),
+                .child(below),
         )
         .child(status_bar)
         .into_any_element()

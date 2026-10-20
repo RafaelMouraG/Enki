@@ -28,7 +28,6 @@ pub struct SessionRecord {
     pub seconds: u64,
     pub completed: bool,
     pub task_id: Option<String>,
-    pub intention: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -189,8 +188,8 @@ impl Store {
     pub fn record_session(&self, s: &SessionRecord) -> Result<()> {
         self.conn.execute(
             "INSERT INTO sessions
-               (id, phase, started_at, ended_at, seconds, completed, task_id, intention, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?4)",
+               (id, phase, started_at, ended_at, seconds, completed, task_id, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?4)",
             params![
                 uuid::Uuid::new_v4().to_string(),
                 s.phase.key(),
@@ -199,7 +198,6 @@ impl Store {
                 s.seconds as i64,
                 s.completed,
                 s.task_id,
-                s.intention,
             ],
         )?;
         if s.phase == Phase::Focus && s.completed {
@@ -337,7 +335,6 @@ mod tests {
                 seconds: 1500,
                 completed,
                 task_id: task.map(Into::into),
-                intention: None,
             })
             .unwrap();
     }

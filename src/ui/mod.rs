@@ -1,5 +1,6 @@
 pub mod components;
 pub mod mini;
+mod player;
 pub mod ring;
 pub mod root;
 mod settings_page;

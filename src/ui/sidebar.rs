@@ -1,19 +1,17 @@
 //! Left column: navigation, task list, now playing and the footer.
 
 use gpui::{
-    div, img, prelude::*, px, AnyElement, Context, FontWeight, ImageSource, ObjectFit,
-    SharedString, Window,
+    div, prelude::*, px, AnyElement, Context, Decorations, FontWeight, SharedString, Window,
 };
 
 use crate::{
     assets::Icon,
-    media::MediaCommand,
     state::{Page, SettingsSection},
     theme::{radius, sidebar_width, with_alpha, Theme},
     ui::{
         components::StyledExt as _,
         components::{glass, icon, icon_button, icon_sized},
-        on_model,
+        on_model, player,
         root::{RootView, TITLEBAR_HEIGHT, TRAFFIC_LIGHTS_WIDTH},
     },
 };
@@ -21,19 +19,21 @@ use crate::{
 const FLOAT_INSET: f32 = 8.;
 const FLOAT_RADIUS: gpui::Pixels = px(18.);
 
-pub fn render(view: &mut RootView, _window: &mut Window, cx: &mut Context<RootView>) -> AnyElement {
+pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootView>) -> AnyElement {
     let model = view.model.clone();
     let theme = Theme::get(cx);
     let enki = model.read(cx);
     let in_settings = matches!(enki.page, Page::Settings(_));
     // The liquid sidebar floats inset from the window edges.
     let inset = if theme.liquid() { FLOAT_INSET } else { 0. };
+    let client_decorated = matches!(window.window_decorations(), Decorations::Client { .. });
 
     let header = div()
         .flex()
         .flex_none()
         .items_center()
-        .h(px(TITLEBAR_HEIGHT - inset))
+        // Inset at the top and the bottom so it centers on the title bar's row.
+        .h(px(TITLEBAR_HEIGHT - 2. * inset))
         .pl(px(if cfg!(target_os = "macos") {
             TRAFFIC_LIGHTS_WIDTH - inset
         } else {
@@ -41,6 +41,7 @@ pub fn render(view: &mut RootView, _window: &mut Window, cx: &mut Context<RootVi
         }))
         .pr(px(10.))
         .window_control_area(gpui::WindowControlArea::Drag)
+        .when(client_decorated, |d| view.drag.attach(d))
         .child(icon_button(
             "sidebar-toggle",
             Icon::PanelLeft,
@@ -66,9 +67,9 @@ pub fn render(view: &mut RootView, _window: &mut Window, cx: &mut Context<RootVi
         .flex_none()
         .map(|d| {
             if theme.liquid() {
-                d.w(sidebar_width() - px(inset))
+                // The same gap on every side, so it doesn't lean on the content.
+                d.w(sidebar_width() - px(2. * inset))
                     .m(px(inset))
-                    .mr_0()
                     .child(glass("sidebar", FLOAT_RADIUS, theme))
             } else {
                 d.w(sidebar_width()).h_full().bg(theme.sidebar_bg)
@@ -285,103 +286,29 @@ fn main_nav(view: &mut RootView, cx: &mut Context<RootView>) -> AnyElement {
             .on_click(on_model(&model, |m, cx| m.dismiss_error(cx)))
     });
 
-    let now_playing = enki.now_playing.clone().map(|np| {
-        let art: AnyElement = match np.art.clone() {
-            Some(path) => img(ImageSource::from(path))
-                .size(px(38.))
-                .rounded(radius::SM)
-                .object_fit(ObjectFit::Cover)
-                .into_any_element(),
-            None => div()
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(38.))
-                .rounded(radius::SM)
-                .bg(theme.surface_active)
-                .child(icon_sized(Icon::Music, px(16.), theme.text_muted))
-                .into_any_element(),
-        };
-        let media_button = |id: &'static str, glyph: Icon, cmd: MediaCommand, size: f32| {
-            let hover = theme.surface_hover;
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(26.))
-                .rounded_full()
-                .cursor_pointer()
-                .hover(move |s| s.bg(hover))
-                .child(icon_sized(glyph, px(size), theme.text))
-                .on_click(on_model(&model, move |m, cx| m.media(cmd, cx)))
-        };
-        div()
-            .mx(px(10.))
-            .mb(px(8.))
-            .p(px(8.))
-            .flex()
-            .items_center()
-            .gap(px(10.))
-            .rounded(radius::LG)
-            // Already on the sidebar's glass; glass on glass looks muddy.
-            .map(|d| {
-                if theme.liquid() {
-                    d.bg(with_alpha(
-                        gpui::white(),
-                        if theme.is_dark { 0.07 } else { 0.5 },
-                    ))
-                } else {
-                    d.bg(theme.surface).border_1().border_color(theme.border)
-                }
-            })
-            .child(art)
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .ellipsis()
-                            .text_size(px(13.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .child(np.title.clone()),
-                    )
-                    .child(
-                        div()
-                            .ellipsis()
-                            .text_size(px(12.))
-                            .text_color(theme.text_muted)
-                            .child(np.artist.clone()),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .child(media_button(
-                        "np-prev",
-                        Icon::SkipBack,
-                        MediaCommand::Previous,
-                        12.,
-                    ))
-                    .child(media_button(
-                        "np-toggle",
-                        if np.playing { Icon::Pause } else { Icon::Play },
-                        MediaCommand::PlayPause,
-                        13.,
-                    ))
-                    .child(media_button(
-                        "np-next",
-                        Icon::SkipForward,
-                        MediaCommand::Next,
-                        12.,
-                    )),
-            )
-    });
+    // The timer page shows the player itself, larger.
+    let now_playing = enki
+        .now_playing
+        .as_ref()
+        .filter(|_| enki.page != Page::Timer)
+        .map(|np| {
+            player::row(np, &model, theme, false)
+                .mx(px(10.))
+                .mb(px(8.))
+                .p(px(8.))
+                .rounded(radius::LG)
+                // Already on the sidebar's glass; glass on glass looks muddy.
+                .map(|d| {
+                    if theme.liquid() {
+                        d.bg(with_alpha(
+                            gpui::white(),
+                            if theme.is_dark { 0.07 } else { 0.5 },
+                        ))
+                    } else {
+                        d.bg(theme.surface).border_1().border_color(theme.border)
+                    }
+                })
+        });
 
     let today = enki.stats.today();
     let goal = enki.settings.daily_goal.max(1);

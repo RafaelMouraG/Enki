@@ -62,7 +62,6 @@ icons! {
     SkipBack => "skip-back",
     SkipForward => "skip-forward",
     Sliders => "sliders",
-    Sparkle => "sparkle",
     Sun => "sun",
     Target => "target",
     Timer => "timer",

@@ -72,7 +72,6 @@ pub struct Enki {
     /// The local day `stats` was computed for, to refresh "today" after midnight.
     stats_day: NaiveDate,
     pub current_task: Option<String>,
-    pub intention: String,
     pub page: Page,
     pub wallpaper: Option<Wallpaper>,
     pub now_playing: Option<NowPlaying>,
@@ -124,7 +123,6 @@ impl Enki {
             stats: Stats::default(),
             stats_day: Local::now().date_naive(),
             current_task: None,
-            intention: String::new(),
             page: Page::Timer,
             wallpaper: None,
             now_playing: None,
@@ -340,7 +338,6 @@ impl Enki {
         let started_at = self
             .phase_started_at
             .unwrap_or(ended_at - finished.elapsed.as_secs() as i64);
-        let intention = self.intention.trim();
         let record = SessionRecord {
             phase: finished.phase,
             started_at,
@@ -348,7 +345,6 @@ impl Enki {
             seconds: finished.elapsed.as_secs(),
             completed: finished.completed,
             task_id: self.current_task.clone(),
-            intention: (!intention.is_empty()).then(|| intention.to_string()),
         };
         if let Some(store) = &self.store {
             if let Err(err) = store.record_session(&record) {

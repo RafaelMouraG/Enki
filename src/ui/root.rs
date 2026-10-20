@@ -15,7 +15,7 @@ use crate::{
     timer::Phase,
     ui::{
         components::StyledExt as _,
-        components::{icon, icon_button},
+        components::{icon, icon_button, WindowDrag},
         on_model, settings_page, sidebar, stats_page, tasks_page,
         text_input::{TextInput, TextInputEvent},
         timer_page,
@@ -28,17 +28,16 @@ pub const TRAFFIC_LIGHTS_WIDTH: f32 = 84.;
 
 pub struct RootView {
     pub model: Entity<Enki>,
-    pub intention_input: Entity<TextInput>,
     pub task_input: Entity<TextInput>,
     /// Which dropdown in the settings page is open.
     pub open_menu: Option<SharedString>,
+    pub drag: WindowDrag,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
 
 impl RootView {
     pub fn new(model: Entity<Enki>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let intention_input = cx.new(|cx| TextInput::new("No que você vai focar?", cx));
         let task_input = cx.new(|cx| TextInput::new("Adicionar tarefa…", cx));
 
         let subscriptions = vec![
@@ -47,23 +46,6 @@ impl RootView {
                 let appearance = window.appearance();
                 this.model
                     .update(cx, |m, cx| m.set_system_appearance(appearance, cx));
-            }),
-            cx.subscribe(&intention_input, |this, input, event, cx| {
-                let text = input.read(cx).text().to_string();
-                match event {
-                    TextInputEvent::Changed => {
-                        this.model.update(cx, |m, _| m.intention = text);
-                    }
-                    TextInputEvent::Submit => {
-                        // Enter in the intention field starts the clock.
-                        this.model.update(cx, |m, cx| {
-                            if !m.timer.is_running() {
-                                m.toggle_timer(cx);
-                            }
-                        });
-                    }
-                    TextInputEvent::Cancel => {}
-                }
             }),
             cx.subscribe(&task_input, |this, input, event, cx| {
                 if let TextInputEvent::Submit = event {
@@ -76,13 +58,13 @@ impl RootView {
 
         Self {
             model,
-            intention_input,
             task_input,
             // Dev helper for screenshots of an open dropdown.
             open_menu: cfg!(debug_assertions)
                 .then(|| std::env::var("ENKI_DEBUG_MENU").ok())
                 .flatten()
                 .map(SharedString::from),
+            drag: WindowDrag::default(),
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
         }
@@ -118,12 +100,15 @@ impl RootView {
                 20.
             }))
             .window_control_area(WindowControlArea::Drag)
-            .when(client_decorated, |d| {
-                d.on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
-            })
+            .when(client_decorated, |d| self.drag.attach(d))
             .on_click(|event, window, _| {
                 if event.click_count() == 2 {
-                    window.titlebar_double_click();
+                    // Only macOS has a system double-click action; elsewhere it maximizes.
+                    if cfg!(target_os = "macos") {
+                        window.titlebar_double_click();
+                    } else {
+                        window.zoom_window();
+                    }
                 }
             })
             .when(!sidebar_open, |d| {
@@ -418,7 +403,11 @@ impl Render for RootView {
             Page::Settings(section) => settings_page::render(self, section, window, cx),
         };
         let sidebar = sidebar_open.then(|| sidebar::render(self, window, cx));
-        let client_decorated = matches!(window.window_decorations(), Decorations::Client { .. });
+        // Drawn edges only while floating; maximized or tiled, the window meets the screen edge.
+        let floating = matches!(
+            window.window_decorations(),
+            Decorations::Client { tiling } if !tiling.is_tiled()
+        );
 
         let theme = Theme::get(cx);
         let has_background = self.model.read(cx).wallpaper.is_some();
@@ -441,6 +430,8 @@ impl Render for RootView {
             .text_color(theme.text)
             .when(!theme.native_glass, |d| d.bg(theme.window_bg))
             .children(background)
+            // Over the whole window, or the floating sidebar's gaps show a seam.
+            .children(shades)
             .children(sidebar)
             .child(
                 div()
@@ -457,19 +448,16 @@ impl Render for RootView {
                     .when(sidebar_open && !liquid, |d| {
                         d.border_l_1().border_color(theme.border)
                     })
-                    .children(shades)
                     .child(titlebar)
                     .child(div().flex().flex_col().flex_1().min_h_0().child(body)),
             )
-            .when(client_decorated, |d| d.child(resize_handles()))
+            .when(floating, |d| d.child(resize_handles()))
             // Painted last: hides glass views nothing placed this frame.
             .child(
                 canvas(|_, _, _| {}, |_, _, window, _| native::glass_end(window))
                     .absolute()
                     .size_0(),
             )
-            .when(client_decorated, |d| {
-                d.rounded(radius::LG).overflow_hidden()
-            })
+            .when(floating, |d| d.rounded(radius::LG).overflow_hidden())
     }
 }

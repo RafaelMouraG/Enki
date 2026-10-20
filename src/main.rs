@@ -37,6 +37,9 @@ fn background_appearance(cx: &App) -> WindowBackgroundAppearance {
     if Theme::get(cx).native_glass {
         // The native backdrop and glass views sit under GPUI's view.
         WindowBackgroundAppearance::Transparent
+    } else if cfg!(target_os = "linux") {
+        // Client-side decorations round the corners; an opaque surface paints them black.
+        WindowBackgroundAppearance::Transparent
     } else {
         WindowBackgroundAppearance::Opaque
     }

@@ -42,6 +42,12 @@ Para gerar um `Enki.app` com ícone (assinado ad-hoc):
 open target/release/Enki.app
 ```
 
+Para instalar em `/Applications`, com atalho no Launchpad e no Spotlight (`--dock` também fixa no Dock):
+
+```sh
+./scripts/install-macos.sh --dock
+```
+
 Na primeira vez que o cartão do Spotify for usado, o macOS pede permissão para o Enki controlar o Spotify.
 
 ### Ubuntu

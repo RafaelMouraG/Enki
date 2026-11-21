@@ -116,10 +116,10 @@ pub fn render(
     cx: &mut Context<RootView>,
 ) -> AnyElement {
     let content: Vec<AnyElement> = match section {
-        SettingsSection::General => general(view, cx),
+        SettingsSection::General => general(view, window, cx),
         SettingsSection::Appearance => appearance(view, window, cx),
         SettingsSection::Timer => timer(view, window, cx),
-        SettingsSection::Notifications => notifications(view, cx),
+        SettingsSection::Notifications => notifications(view, window, cx),
         SettingsSection::Shortcuts => shortcuts(cx),
     };
     let theme = Theme::get(cx);
@@ -144,11 +144,24 @@ pub fn render(
         .into_any_element()
 }
 
-fn general(view: &mut RootView, cx: &mut Context<RootView>) -> Vec<AnyElement> {
+fn general(view: &mut RootView, window: &mut Window, cx: &mut Context<RootView>) -> Vec<AnyElement> {
     let model = view.model.clone();
-    let theme = Theme::get(cx);
-    let s = &model.read(cx).settings;
+    let theme = Theme::get(cx).clone();
+    let theme = &theme;
+    let s = model.read(cx).settings.clone();
     let goal = s.daily_goal;
+    let clear_music_btn = button(
+        "clear-music-history",
+        "Limpar",
+        ButtonKind::Ghost,
+        theme,
+        window,
+        cx,
+        {
+            let model = model.clone();
+            move |_, _, cx| model.update(cx, |m, cx| m.clear_music_history(cx))
+        },
+    );
     vec![
         card("settings-card-1", theme)
             .child(setting_row(
@@ -187,7 +200,7 @@ fn general(view: &mut RootView, cx: &mut Context<RootView>) -> Vec<AnyElement> {
                 false,
                 "Música tocando agora",
                 Some(if cfg!(target_os = "macos") {
-                    "Mostra e controla o Spotify na barra lateral. Não precisa de login.".into()
+                    "Mostra e controla Spotify e Apple Music. Não precisa de login.".into()
                 } else {
                     "Mostra e controla o player ativo (Spotify ou outro via MPRIS).".into()
                 }),
@@ -197,6 +210,23 @@ fn general(view: &mut RootView, cx: &mut Context<RootView>) -> Vec<AnyElement> {
                     theme,
                     set(&model, |s| s.now_playing = !s.now_playing),
                 ),
+            ))
+            .child(setting_row(
+                theme,
+                false,
+                "Histórico de música (Wrapped)",
+                Some("Registra faixas tocadas para montar seu Wrapped na barra lateral.".into()),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(clear_music_btn)
+                    .child(toggle(
+                        "set-track-music",
+                        s.track_music,
+                        theme,
+                        set(&model, |s| s.track_music = !s.track_music),
+                    )),
             ))
             .child(setting_row(
                 theme,
@@ -617,6 +647,30 @@ fn appearance(
             .into_any_element(),
     };
     let theme_ref = theme;
+    let pick_btn = button(
+        "pick-image",
+        if image_name.is_some() {
+            "Substituir imagem"
+        } else {
+            "Escolher imagem"
+        },
+        ButtonKind::Secondary,
+        theme_ref,
+        window,
+        cx,
+        pick_image,
+    );
+    let remove_btn = image_name.is_some().then(|| {
+        button(
+            "remove-image",
+            "Remover",
+            ButtonKind::Danger,
+            theme_ref,
+            window,
+            cx,
+            set(&model, |s| s.background_image = None),
+        )
+    });
     let image_row = div()
         .flex()
         .items_center()
@@ -651,26 +705,8 @@ fn appearance(
                         ),
                 ),
         )
-        .child(button(
-            "pick-image",
-            if image_name.is_some() {
-                "Substituir imagem"
-            } else {
-                "Escolher imagem"
-            },
-            ButtonKind::Secondary,
-            theme_ref,
-            pick_image,
-        ))
-        .when(image_name.is_some(), |d| {
-            d.child(button(
-                "remove-image",
-                "Remover",
-                ButtonKind::Danger,
-                theme_ref,
-                set(&model, |s| s.background_image = None),
-            ))
-        });
+        .child(pick_btn)
+        .children(remove_btn);
 
     let dim = stop_slider(
         &DIM_STOPS,
@@ -909,7 +945,11 @@ fn timer(view: &mut RootView, window: &mut Window, cx: &mut Context<RootView>) -
     ]
 }
 
-fn notifications(view: &mut RootView, cx: &mut Context<RootView>) -> Vec<AnyElement> {
+fn notifications(
+    view: &mut RootView,
+    window: &mut Window,
+    cx: &mut Context<RootView>,
+) -> Vec<AnyElement> {
     let model = view.model.clone();
     let s = model.read(cx).settings.clone();
     let sound_model = model.clone();
@@ -924,7 +964,20 @@ fn notifications(view: &mut RootView, cx: &mut Context<RootView>) -> Vec<AnyElem
             sound_model.update(cx, |m, cx| m.update_settings(cx, |s| s.sound = v));
         },
     );
-    let theme = Theme::get(cx);
+    let theme = Theme::get(cx).clone();
+    let theme = &theme;
+    let test_btn = button(
+        "test-notification",
+        "Enviar teste",
+        ButtonKind::Secondary,
+        theme,
+        window,
+        cx,
+        move |_, _, _| {
+            notify::play(s.sound);
+            notify::notify("Enki", "As notificações estão funcionando.");
+        },
+    );
     vec![card("settings-card-8", theme)
         .child(setting_row(
             theme,
@@ -950,16 +1003,7 @@ fn notifications(view: &mut RootView, cx: &mut Context<RootView>) -> Vec<AnyElem
             false,
             "Testar",
             Some("Envia uma notificação de exemplo agora.".into()),
-            button(
-                "test-notification",
-                "Enviar teste",
-                ButtonKind::Secondary,
-                theme,
-                move |_, _, _| {
-                    notify::play(s.sound);
-                    notify::notify("Enki", "As notificações estão funcionando.");
-                },
-            ),
+            test_btn,
         ))
         .into_any_element()]
 }
@@ -978,6 +1022,7 @@ fn shortcuts(cx: &mut Context<RootView>) -> Vec<AnyElement> {
         ("Timer", vec![cmd.into(), "1".into()]),
         ("Tarefas", vec![cmd.into(), "2".into()]),
         ("Estatísticas", vec![cmd.into(), "3".into()]),
+        ("Wrapped", vec![cmd.into(), "4".into()]),
         ("Nova tarefa", vec![cmd.into(), "N".into()]),
         (
             "Mostrar/ocultar barra lateral",

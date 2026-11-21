@@ -10,11 +10,13 @@ use gpui::{
 use crate::{
     assets::Icon,
     native::{self, Haptic},
-    theme::{clock_font, with_alpha, Theme},
+    theme::{clock_font, mix_hsla, with_alpha, Theme},
     timer::Phase,
     ui::{
-        components::StyledExt as _,
-        components::{glass, glass_styled, icon, icon_sized, segmented, SegmentOption},
+        components::{
+            ease_out_cubic, glass, glass_shadow, glass_styled, hover_track, icon, icon_sized,
+            liquid_highlights, segmented, ClickHandler, SegmentOption, StyledExt as _,
+        },
         format_minutes, on_model, player,
         ring::{mini_ring, ring},
         root::RootView,
@@ -27,14 +29,47 @@ const PLAYER_RADIUS: gpui::Pixels = px(18.);
 pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootView>) -> AnyElement {
     let intention_focused = view.intention_input.focus_handle(cx).is_focused(window);
     let model = view.model.clone();
-    let theme = Theme::get(cx);
-    let enki = model.read(cx);
-    let timer = &enki.timer;
+    let theme = Theme::get(cx).clone();
+    let theme = &theme;
     let now = Instant::now();
-    let phase = timer.phase();
+    let (
+        phase,
+        is_running,
+        is_paused,
+        is_idle,
+        progress,
+        clock_text,
+        phase_caption,
+        reduce_motion,
+        has_wallpaper,
+        current_task,
+        has_intention,
+        now_playing,
+        today,
+        streak,
+        goal,
+    ) = {
+        let enki = model.read(cx);
+        let timer = &enki.timer;
+        (
+            timer.phase(),
+            timer.is_running(),
+            timer.is_paused(),
+            timer.is_idle(),
+            timer.progress(now),
+            enki.clock_text(),
+            enki.phase_caption(),
+            enki.settings.reduce_motion,
+            enki.wallpaper.is_some(),
+            enki.current_task_title().map(str::to_string),
+            !enki.intention.trim().is_empty(),
+            enki.now_playing.clone(),
+            enki.stats.today(),
+            enki.stats.streak,
+            enki.settings.daily_goal.max(1),
+        )
+    };
     let color = theme.phase_color(phase.is_break());
-    let reduce_motion = enki.settings.reduce_motion;
-    let has_wallpaper = enki.wallpaper.is_some();
     let liquid = theme.liquid();
 
     let phases = [Phase::Focus, Phase::ShortBreak, Phase::LongBreak]
@@ -46,14 +81,15 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
             on_click: Box::new(on_model(&model, move |m, cx| m.select_phase(p, cx))),
         })
         .collect();
+    let phase_bar = segmented("phase", theme, window, cx, phases);
 
-    let status = if timer.is_running() {
-        enki.phase_caption()
-    } else if timer.is_paused() {
+    let status = if is_running {
+        phase_caption
+    } else if is_paused {
         "Pausado".to_string()
     } else {
         match phase {
-            Phase::Focus => enki.phase_caption(),
+            Phase::Focus => phase_caption,
             _ => format!("{} · pronta", phase.label()),
         }
     };
@@ -69,12 +105,12 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
                 .line_height(px(84.))
                 .font(clock_font(FontWeight::LIGHT))
                 .text_color(theme.text)
-                .child(enki.clock_text()),
+                .child(clock_text),
         )
         .child(
             div()
                 .text_size(px(14.))
-                .text_color(if timer.is_paused() {
+                .text_color(if is_paused {
                     theme.text_faint
                 } else {
                     theme.text_muted
@@ -89,7 +125,7 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
         .justify_center()
         .size(px(RING))
         .child(div().absolute().inset_0().child(ring(
-            timer.progress(now),
+            progress,
             px(RING),
             px(7.),
             theme.ring_track,
@@ -110,44 +146,102 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
             .into_any_element()
     };
 
-    let round = |id: &'static str, glyph: Icon, size: f32, primary: bool| {
-        let (bg, fg, hover) = if primary {
+    let mut round = |id: &'static str,
+                     glyph: Icon,
+                     size: f32,
+                     primary: bool,
+                     on_click: ClickHandler|
+     -> AnyElement {
+        let track = hover_track(id, theme.reduce_motion, window, cx);
+        let is_dark = theme.is_dark;
+        let r = px(size / 2.);
+        let (bg, fg, hover_bg) = if primary {
             (
                 theme.primary_button,
                 theme.primary_button_fg,
-                with_alpha(theme.primary_button, 0.88),
+                mix_hsla(
+                    theme.primary_button,
+                    if is_dark { gpui::white() } else { gpui::black() },
+                    0.12,
+                ),
             )
         } else {
             (
-                with_alpha(theme.surface, 0.8),
+                with_alpha(gpui::white(), if is_dark { 0.075 } else { 0.62 }),
                 theme.text,
-                theme.surface_hover,
+                with_alpha(gpui::white(), if is_dark { 0.16 } else { 0.86 }),
             )
         };
         let glassy = liquid && !primary;
+        let border_rest = if primary {
+            with_alpha(gpui::white(), if is_dark { 0.25 } else { 0.12 })
+        } else if is_dark {
+            with_alpha(gpui::white(), 0.16)
+        } else {
+            with_alpha(gpui::black(), 0.1)
+        };
+        let border_hover = if primary {
+            with_alpha(gpui::white(), if is_dark { 0.55 } else { 0.28 })
+        } else if is_dark {
+            with_alpha(gpui::white(), 0.38)
+        } else {
+            with_alpha(gpui::black(), 0.18)
+        };
+        let icon_size = px(if primary { 22. } else { 17. });
+
+        // Visual-only hover layer inside a stationary outer button:
+        // rock-steady glass/icon (zero jitter) and reliable single-click hitbox.
+        let visual = track.animate(
+            div()
+                .relative()
+                .flex()
+                .items_center()
+                .justify_center()
+                .size_full()
+                .rounded_full()
+                .border_1(),
+            230,
+            ease_out_cubic,
+            move |d, t| {
+                let tc = t.clamp(0.0, 1.0);
+                d.map(|d| {
+                    if glassy {
+                        d.bg(with_alpha(
+                            gpui::white(),
+                            if is_dark {
+                                0.03 + 0.12 * tc
+                            } else {
+                                0.22 + 0.36 * tc
+                            },
+                        ))
+                    } else {
+                        d.bg(mix_hsla(bg, hover_bg, tc))
+                    }
+                })
+                .border_color(mix_hsla(border_rest, border_hover, tc))
+                .shadow(glass_shadow(is_dark, if primary { 0.55 } else { 0.28 }, tc))
+                .when(!primary || is_dark, |d| {
+                    d.child(liquid_highlights(
+                        r,
+                        is_dark,
+                        if primary { 0.3 } else { 0.85 },
+                        tc,
+                    ))
+                })
+                .child(div().relative().child(icon_sized(glyph, icon_size, fg)))
+            },
+        );
+
         div()
             .id(id)
             .relative()
             .flex()
-            .items_center()
-            .justify_center()
+            .flex_none()
             .size(px(size))
             .rounded_full()
-            .map(|d| {
-                if glassy {
-                    d.child(glass_styled(id, px(size / 2.), true, theme))
-                        .hover(|s| s.bg(with_alpha(gpui::white(), 0.08)))
-                } else {
-                    d.bg(bg).hover(move |s| s.bg(hover))
-                }
-            })
-            .when(!primary && !liquid, |d| {
-                d.border_1().border_color(theme.border)
-            })
-            .when(primary, |d| d.shadow(theme.card_shadow()))
             .cursor_pointer()
-            .active(|s| s.opacity(0.85))
-            // A tap from the trackpad as the button goes down.
+            .active(|s| s.opacity(0.84))
+            .on_hover(track.on_hover())
             .on_mouse_down(MouseButton::Left, move |_, _, _| {
                 native::haptic(if primary {
                     Haptic::LevelChange
@@ -155,79 +249,128 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
                     Haptic::Generic
                 })
             })
-            .child(icon_sized(glyph, px(if primary { 22. } else { 17. }), fg))
+            .on_click(on_click)
+            .when(glassy, |d| d.child(glass_styled(id, r, true, theme)))
+            .child(visual)
+            .into_any_element()
     };
+
+    let reset_btn = round(
+        "timer-reset",
+        Icon::RotateCcw,
+        46.,
+        false,
+        Box::new(on_model(&model, |m, cx| m.reset_timer(cx))),
+    );
+    let toggle_btn = round(
+        "timer-toggle",
+        if is_running { Icon::Pause } else { Icon::Play },
+        64.,
+        true,
+        Box::new(on_model(&model, |m, cx| m.toggle_timer(cx))),
+    );
+    let skip_btn = round(
+        "timer-skip",
+        Icon::Skip,
+        46.,
+        false,
+        Box::new(on_model(&model, |m, cx| m.skip_phase(cx))),
+    );
 
     let controls = div()
         .flex()
         .items_center()
         .gap(px(20.))
-        .child(
-            round("timer-reset", Icon::RotateCcw, 46., false)
-                .on_click(on_model(&model, |m, cx| m.reset_timer(cx))),
-        )
-        .child(
-            round(
-                "timer-toggle",
-                if timer.is_running() {
-                    Icon::Pause
-                } else {
-                    Icon::Play
-                },
-                64.,
-                true,
-            )
-            .on_click(on_model(&model, |m, cx| m.toggle_timer(cx))),
-        )
-        .child(
-            round("timer-skip", Icon::Skip, 46., false)
-                .on_click(on_model(&model, |m, cx| m.skip_phase(cx))),
+        .child(reset_btn)
+        .child(toggle_btn)
+        .child(skip_btn);
+
+    let extend_button = (!is_idle).then(|| {
+        let track = hover_track("timer-extend", theme.reduce_motion, window, cx);
+        let is_dark = theme.is_dark;
+        let rest_bg = if liquid {
+            with_alpha(gpui::white(), if is_dark { 0.04 } else { 0.28 })
+        } else {
+            with_alpha(gpui::white(), if is_dark { 0.08 } else { 0.65 })
+        };
+        let hover_bg = if liquid {
+            with_alpha(gpui::white(), if is_dark { 0.14 } else { 0.58 })
+        } else {
+            with_alpha(gpui::white(), if is_dark { 0.16 } else { 0.88 })
+        };
+        let rest_border = with_alpha(
+            if is_dark {
+                gpui::white()
+            } else {
+                gpui::black()
+            },
+            if is_dark { 0.16 } else { 0.1 },
+        );
+        let hover_border = with_alpha(
+            if is_dark {
+                gpui::white()
+            } else {
+                gpui::black()
+            },
+            if is_dark { 0.36 } else { 0.18 },
+        );
+        let muted = theme.text_muted;
+        let text_color = theme.text;
+
+        let visual = track.animate(
+            div()
+                .relative()
+                .flex()
+                .items_center()
+                .justify_center()
+                .h_full()
+                .px(px(14.))
+                .rounded_full()
+                .border_1()
+                .text_size(px(12.5))
+                .font_weight(FontWeight::MEDIUM),
+            230,
+            ease_out_cubic,
+            move |d, t| {
+                let tc = t.clamp(0.0, 1.0);
+                d.bg(mix_hsla(rest_bg, hover_bg, tc))
+                    .border_color(mix_hsla(rest_border, hover_border, tc))
+                    .text_color(mix_hsla(muted, text_color, tc))
+                    .shadow(glass_shadow(is_dark, 0.25, tc))
+                    .child(liquid_highlights(px(15.), is_dark, 0.85, tc))
+                    .child(div().relative().child("+5 min"))
+            },
         );
 
-    let extend_button = (!timer.is_idle()).then(|| {
-        let hover = theme.surface_hover;
-        let text_color = theme.text;
         div()
             .id("timer-extend")
             .relative()
             .flex()
-            .items_center()
-            .justify_center()
-            .h(px(28.))
-            .px(px(12.))
+            .h(px(30.))
             .rounded_full()
-            .text_size(px(12.5))
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(theme.text_muted)
-            .map(|d| {
-                if liquid {
-                    d.child(glass_styled("timer-extend", px(14.), true, theme))
-                        .hover(move |s| s.bg(with_alpha(gpui::white(), 0.08)).text_color(text_color))
-                } else {
-                    d.bg(with_alpha(theme.surface, 0.8))
-                        .border_1()
-                        .border_color(theme.border)
-                        .hover(move |s| s.bg(hover).text_color(text_color))
-                }
-            })
             .cursor_pointer()
-            .active(|s| s.opacity(0.85))
+            .active(|s| s.opacity(0.84))
+            .on_hover(track.on_hover())
             .on_mouse_down(MouseButton::Left, |_, _, _| native::haptic(Haptic::Generic))
             .on_click(on_model(&model, |m, cx| {
                 m.extend_timer(Duration::from_secs(5 * 60), cx)
             }))
-            .child("+5 min")
+            .when(liquid, |d| {
+                d.child(glass_styled("timer-extend", px(15.), true, theme))
+            })
+            .child(visual)
+            .into_any_element()
     });
 
     let controls_block = div()
         .flex()
         .flex_col()
         .items_center()
-        .gap(px(12.))
+        .gap(px(10.))
         .child(controls)
         .child(
             div()
-                .h(px(28.))
+                .h(px(30.))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -235,8 +378,33 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
         );
 
     // The current task (or a quick focus intention) and, when something is playing, the player.
-    let current_task = enki.current_task_title().map(|t| t.to_string());
-    let has_intention = !enki.intention.trim().is_empty();
+    let player_card = now_playing.as_ref().map(|np| {
+        let row = player::row(np, &model, theme, true, window, cx)
+            .relative()
+            .size_full()
+            .pl(px(8.))
+            .pr(px(10.));
+        div()
+            .relative()
+            .h(px(60.))
+            .rounded(PLAYER_RADIUS)
+            .map(|d| {
+                if liquid {
+                    d.child(glass("player", PLAYER_RADIUS, theme))
+                } else {
+                    d.bg(if has_wallpaper {
+                        with_alpha(theme.surface, 0.86)
+                    } else {
+                        theme.surface
+                    })
+                    .border_1()
+                    .border_color(theme.border_strong)
+                    .shadow(theme.card_shadow())
+                }
+            })
+            .child(row)
+    });
+
     let intention_chip = (current_task.is_none() && phase == Phase::Focus).then(|| {
         let input = view.intention_input.clone();
         let clear_input = input.clone();
@@ -368,40 +536,8 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
                 ),
             )
         })
-        .when_some(enki.now_playing.as_ref(), |d, np| {
-            // The glass goes first, under the row.
-            d.child(
-                div()
-                    .relative()
-                    .h(px(60.))
-                    .rounded(PLAYER_RADIUS)
-                    .map(|d| {
-                        if liquid {
-                            d.child(glass("player", PLAYER_RADIUS, theme))
-                        } else {
-                            d.bg(if has_wallpaper {
-                                with_alpha(theme.surface, 0.86)
-                            } else {
-                                theme.surface
-                            })
-                            .border_1()
-                            .border_color(theme.border_strong)
-                            .shadow(theme.card_shadow())
-                        }
-                    })
-                    .child(
-                        player::row(np, &model, theme, true)
-                            .relative()
-                            .size_full()
-                            .pl(px(8.))
-                            .pr(px(10.)),
-                    ),
-            )
-        });
+        .children(player_card);
 
-    let stats = &enki.stats;
-    let today = stats.today();
-    let goal = enki.settings.daily_goal.max(1);
     let goal_progress = today.pomodoros as f32 / goal as f32;
     let status_bar = div()
         .flex()
@@ -436,7 +572,7 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
                         .items_center()
                         .gap(px(6.))
                         .child(icon_sized(Icon::Flame, px(13.), theme.text_faint))
-                        .child(match stats.streak {
+                        .child(match streak {
                             0 => "Sem sequência".to_string(),
                             1 => "1 dia seguido".to_string(),
                             n => format!("{n} dias seguidos"),
@@ -471,7 +607,7 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
                 .w_full()
                 .gap(px(28.))
                 .py(px(12.))
-                .child(segmented("phase", theme, phases))
+                .child(phase_bar)
                 .child(ring_block)
                 .child(controls_block)
                 .child(below),

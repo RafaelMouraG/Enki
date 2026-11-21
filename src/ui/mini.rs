@@ -11,10 +11,12 @@ use crate::{
     assets::Icon,
     native,
     state::Enki,
-    theme::{clock_font, radius, Theme, UI_FONT},
+    theme::{clock_font, radius, with_alpha, Theme, UI_FONT},
     ui::{
-        components::StyledExt as _,
-        components::{glass, icon_button, icon_sized, WindowDrag},
+        components::{
+            ease_out_cubic, glass, glass_shadow, hover_track, icon_button, icon_sized,
+            liquid_highlights, StyledExt as _, WindowDrag,
+        },
         on_model,
         ring::ring,
     },
@@ -47,51 +49,100 @@ impl Focusable for MiniView {
 
 impl Render for MiniView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::get(cx);
+        let theme = Theme::get(cx).clone();
         // Glass over whatever is behind the window; no backdrop of our own.
         native::glass_begin(window, theme.native_glass, None);
-        let enki = self.model.read(cx);
-        let timer = &enki.timer;
-        let color = theme.phase_color(timer.phase().is_break());
-        let caption = enki
-            .current_task_title()
-            .map(str::to_string)
-            .unwrap_or_else(|| enki.phase_caption());
+        let (is_break, is_running, progress, clock_text, caption) = {
+            let enki = self.model.read(cx);
+            let timer = &enki.timer;
+            (
+                timer.phase().is_break(),
+                timer.is_running(),
+                timer.progress(Instant::now()),
+                enki.clock_text(),
+                enki.current_task_title()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| enki.phase_caption()),
+            )
+        };
+        let color = theme.phase_color(is_break);
         let client_decorated = matches!(
             window.window_decorations(),
             gpui::Decorations::Client { .. }
+        );
+
+        let toggle_track = hover_track("mini-toggle", theme.reduce_motion, window, cx);
+        let is_dark = theme.is_dark;
+        let ring_track = theme.ring_track;
+        let text_color = theme.text;
+        let toggle_visual = toggle_track.animate(
+            div()
+                .relative()
+                .flex()
+                .items_center()
+                .justify_center()
+                .size_full()
+                .rounded_full(),
+            210,
+            ease_out_cubic,
+            move |d, t| {
+                let tc = t.clamp(0.0, 1.0);
+                d.bg(with_alpha(
+                    gpui::white(),
+                    if is_dark { 0.1 * tc } else { 0.55 * tc },
+                ))
+                .shadow(glass_shadow(is_dark, 0.0, tc))
+                .when(tc > 0.01, |d| {
+                    d.child(liquid_highlights(px(24.), is_dark, 0.0, tc))
+                })
+                .child(div().relative().child(icon_sized(
+                    if is_running { Icon::Pause } else { Icon::Play },
+                    px(16.),
+                    text_color,
+                )))
+            },
         );
 
         let toggle = div()
             .id("mini-toggle")
             .relative()
             .flex()
-            .items_center()
-            .justify_center()
             .size(px(48.))
+            .rounded_full()
             .flex_none()
             .cursor_pointer()
-            .child(div().absolute().inset_0().child(ring(
-                timer.progress(Instant::now()),
-                px(48.),
-                px(4.),
-                theme.ring_track,
-                color,
-            )))
-            .child(icon_sized(
-                if timer.is_running() {
-                    Icon::Pause
-                } else {
-                    Icon::Play
-                },
-                px(16.),
-                theme.text,
-            ))
-            .hover(|s| s.opacity(0.8))
+            .on_hover(toggle_track.on_hover())
             .on_mouse_down(MouseButton::Left, |_, _, _| {
                 native::haptic(native::Haptic::LevelChange)
             })
-            .on_click(on_model(&self.model, |m, cx| m.toggle_timer(cx)));
+            .on_click(on_model(&self.model, |m, cx| m.toggle_timer(cx)))
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .child(ring(progress, px(48.), px(4.), ring_track, color)),
+            )
+            .child(toggle_visual);
+
+        let expand_btn = icon_button(
+            "mini-expand",
+            Icon::Expand,
+            &theme,
+            window,
+            cx,
+            |_, _, cx| {
+                crate::show_main_window(cx);
+                crate::toggle_mini_window(cx);
+            },
+        );
+        let skip_btn = icon_button(
+            "mini-skip",
+            Icon::Skip,
+            &theme,
+            window,
+            cx,
+            on_model(&self.model, |m, cx| m.skip_phase(cx)),
+        );
 
         div()
             .id("mini")
@@ -108,7 +159,7 @@ impl Render for MiniView {
             .relative()
             .map(|d| {
                 if theme.native_glass {
-                    d.child(glass("mini", radius::LG, theme))
+                    d.child(glass("mini", radius::LG, &theme))
                 } else {
                     d.bg(theme.window_bg)
                 }
@@ -128,7 +179,7 @@ impl Render for MiniView {
                             .text_size(px(28.))
                             .line_height(px(32.))
                             .font(clock_font(FontWeight::LIGHT))
-                            .child(enki.clock_text()),
+                            .child(clock_text),
                     )
                     .child(
                         div()
@@ -143,21 +194,8 @@ impl Render for MiniView {
                     .flex()
                     .flex_col()
                     .gap(px(2.))
-                    .child(icon_button(
-                        "mini-expand",
-                        Icon::Expand,
-                        theme,
-                        |_, _, cx| {
-                            crate::show_main_window(cx);
-                            crate::toggle_mini_window(cx);
-                        },
-                    ))
-                    .child(icon_button(
-                        "mini-skip",
-                        Icon::Skip,
-                        theme,
-                        on_model(&self.model, |m, cx| m.skip_phase(cx)),
-                    )),
+                    .child(expand_btn)
+                    .child(skip_btn),
             )
             .child(
                 canvas(|_, _, _| {}, |_, _, window, _| native::glass_end(window))

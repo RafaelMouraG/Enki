@@ -511,6 +511,17 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
         )
     });
     let done_len = done.len();
+    let clear_done_btn = (!done.is_empty()).then(|| {
+        button(
+            "clear-done",
+            "Limpar concluídas",
+            ButtonKind::Ghost,
+            &theme,
+            window,
+            cx,
+            on_model(&model, |m, cx| m.clear_done_tasks(cx)),
+        )
+    });
     let done_section = (!done.is_empty()).then(|| {
         div()
             .flex()
@@ -521,13 +532,7 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
                     .items_center()
                     .justify_between()
                     .child(section_label(&theme, "Concluídas"))
-                    .child(button(
-                        "clear-done",
-                        "Limpar concluídas",
-                        ButtonKind::Ghost,
-                        &theme,
-                        on_model(&model, |m, cx| m.clear_done_tasks(cx)),
-                    )),
+                    .children(clear_done_btn),
             )
             .child(card("tasks-done", &theme).children(
                 done.into_iter()

@@ -1,18 +1,212 @@
 //! Small themed building blocks shared by every page.
 
-use std::rc::Rc;
+use std::{cell::Cell, rc::Rc, time::Duration};
 
 use gpui::{
-    canvas, div, prelude::*, px, svg, AnyElement, App, ClickEvent, CursorStyle, DispatchPhase, Div,
+    canvas, div, linear_color_stop, linear_gradient, point, prelude::*, px, svg, Animation,
+    AnimationExt as _, AnyElement, App, BoxShadow, ClickEvent, CursorStyle, DispatchPhase, Div,
     ElementId, FontWeight, HitboxBehavior, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, SharedString, Stateful, Svg, Window,
+    MouseUpEvent, Pixels, SharedString, Svg, Window,
 };
 
 use crate::{
     assets::Icon,
     native::{self, GlassStyle, Haptic},
-    theme::{radius, with_alpha, Theme},
+    theme::{mix_hsla, radius, with_alpha, Theme},
 };
+
+/// Smooth cubic deceleration for color, sheen and shadow transitions.
+pub fn ease_out_cubic(t: f32) -> f32 {
+    let inv = 1.0 - t.clamp(0.0, 1.0);
+    1.0 - inv * inv * inv
+}
+
+#[derive(Clone)]
+struct HoverState {
+    hovered: bool,
+    from: f32,
+    to: f32,
+    current: Rc<Cell<f32>>,
+    epoch: u64,
+}
+
+impl Default for HoverState {
+    fn default() -> Self {
+        Self {
+            hovered: false,
+            from: 0.0,
+            to: 0.0,
+            current: Rc::new(Cell::new(0.0)),
+            epoch: 0,
+        }
+    }
+}
+
+/// Interruptible, keyed hover animation handle. Rapid enter/leave transitions
+/// pick up from the exact in-flight visual progress with zero jump.
+#[derive(Clone)]
+pub struct HoverTrack {
+    key: SharedString,
+    from: f32,
+    to: f32,
+    current: Rc<Cell<f32>>,
+    epoch: u64,
+    reduce_motion: bool,
+    state: gpui::Entity<HoverState>,
+}
+
+impl HoverTrack {
+    pub fn on_hover(&self) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
+        let state = self.state.clone();
+        let reduce_motion = self.reduce_motion;
+        move |entered, _, cx| {
+            state.update(cx, |s, cx| {
+                if s.hovered == *entered {
+                    return;
+                }
+                s.hovered = *entered;
+                let target = if *entered { 1.0 } else { 0.0 };
+                s.from = if reduce_motion {
+                    target
+                } else {
+                    s.current.get().clamp(0.0, 1.0)
+                };
+                s.to = target;
+                s.epoch = s.epoch.wrapping_add(1);
+                cx.notify();
+            });
+        }
+    }
+
+    /// Runs `apply(el, t)` with `t` smoothly interpolated between `0.0` and `1.0`.
+    pub fn animate<E: IntoElement + 'static>(
+        &self,
+        el: E,
+        duration_ms: u64,
+        easing: impl Fn(f32) -> f32 + 'static,
+        apply: impl Fn(E, f32) -> E + 'static,
+    ) -> AnyElement {
+        if self.epoch == 0 || self.reduce_motion || (self.to - self.from).abs() < 1e-4 {
+            self.current.set(self.to);
+            return apply(el, self.to).into_any_element();
+        }
+        let from = self.from;
+        let to = self.to;
+        let current = self.current.clone();
+        el.with_animation(
+            SharedString::from(format!("{}-hv-{}", self.key, self.epoch)),
+            Animation::new(Duration::from_millis(duration_ms)).with_easing(easing),
+            move |el, delta| {
+                let raw = from + (to - from) * delta;
+                current.set(raw.clamp(0.0, 1.0));
+                apply(el, raw)
+            },
+        )
+        .into_any_element()
+    }
+}
+
+pub fn hover_track(
+    id: impl Into<SharedString>,
+    reduce_motion: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> HoverTrack {
+    let key: SharedString = id.into();
+    let state = window.use_keyed_state(
+        ElementId::Name(format!("hover-track-{key}").into()),
+        cx,
+        |_, _| HoverState::default(),
+    );
+    let snap = state.read(cx);
+    HoverTrack {
+        key,
+        from: snap.from,
+        to: snap.to,
+        current: snap.current.clone(),
+        epoch: snap.epoch,
+        reduce_motion,
+        state,
+    }
+}
+
+/// Soft, neutral diffused depth shadow for liquid glass controls (never harsh).
+pub fn glass_shadow(is_dark: bool, rest: f32, t: f32) -> Vec<BoxShadow> {
+    let t = t.clamp(0.0, 1.0);
+    let strength = rest + (1.0 - rest) * t;
+    if strength <= 0.01 {
+        return Vec::new();
+    }
+    let alpha = if is_dark { 0.34 } else { 0.11 } * strength;
+    let ambient = if is_dark { 0.16 } else { 0.05 } * strength;
+    vec![
+        BoxShadow {
+            color: with_alpha(gpui::black(), alpha),
+            offset: point(px(0.), px(2. + 6. * t)),
+            blur_radius: px(10. + 14. * t),
+            spread_radius: px(-3. - t),
+        },
+        BoxShadow {
+            color: with_alpha(gpui::black(), ambient),
+            offset: point(px(0.), px(1.)),
+            blur_radius: px(3. + 2. * t),
+            spread_radius: px(0.),
+        },
+    ]
+}
+
+/// Monochromatic top meniscus highlight + subtle rotating specular sheen that
+/// glides smoothly across a rounded liquid-glass surface as `t: 0.0 → 1.0`.
+/// Every layer fills the full rounded quad so GPUI's SDF shader clips cleanly
+/// to circles and capsules with zero rectangular corner bleed.
+pub fn liquid_highlights(radius: Pixels, is_dark: bool, base: f32, t: f32) -> AnyElement {
+    let t = t.clamp(0.0, 1.0);
+    let top_alpha = if is_dark {
+        0.10 * base + 0.14 * t
+    } else {
+        0.48 * base + 0.30 * t
+    };
+    let rim_alpha = if is_dark {
+        0.18 * base + 0.24 * t
+    } else {
+        0.70 * base + 0.28 * t
+    };
+    let sheen_alpha = if is_dark { 0.14 * t } else { 0.38 * t };
+    let sheen_angle = 115. + 60. * t;
+
+    div()
+        .absolute()
+        .inset_0()
+        .rounded(radius)
+        .bg(linear_gradient(
+            180.,
+            linear_color_stop(with_alpha(gpui::white(), top_alpha), 0.0),
+            linear_color_stop(with_alpha(gpui::white(), 0.0), 0.55),
+        ))
+        .when(t > 0.01, |d| {
+            d.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .rounded(radius)
+                    .bg(linear_gradient(
+                        sheen_angle,
+                        linear_color_stop(with_alpha(gpui::white(), sheen_alpha), 0.0),
+                        linear_color_stop(with_alpha(gpui::white(), 0.0), 0.65),
+                    )),
+            )
+        })
+        .child(
+            // Crisp 1px top catchlight following the rounded edge.
+            div()
+                .absolute()
+                .inset_0()
+                .rounded(radius)
+                .border_t_1()
+                .border_color(with_alpha(gpui::white(), rim_alpha)),
+        )
+        .into_any_element()
+}
 
 /// Single-line text with an ellipsis. GPUI's own `truncate()` caches the
 /// unconstrained width when combined with `nowrap` and never truncates, while
@@ -139,32 +333,86 @@ pub fn icon_sized(icon: Icon, size: Pixels, color: Hsla) -> Svg {
         .text_color(color)
 }
 
-/// Square ghost button with a single icon, like the ones in Zeron's title bar.
+/// Circular frosted-glass icon button with monochromatic specular hover.
 pub fn icon_button(
-    id: impl Into<ElementId>,
+    id: impl Into<SharedString>,
     glyph: Icon,
     theme: &Theme,
+    window: &mut Window,
+    cx: &mut App,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> Stateful<Div> {
-    let (muted, text, hover) = (theme.text_muted, theme.text, theme.surface_hover);
+) -> AnyElement {
+    icon_button_sized(id, glyph, px(30.), theme, window, cx, on_click)
+}
+
+pub fn icon_button_sized(
+    id: impl Into<SharedString>,
+    glyph: Icon,
+    box_size: Pixels,
+    theme: &Theme,
+    window: &mut Window,
+    cx: &mut App,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let id: SharedString = id.into();
+    let track = hover_track(id.clone(), theme.reduce_motion, window, cx);
+    let (muted, text, is_dark) = (theme.text_muted, theme.text, theme.is_dark);
+    let radius = box_size / 2.0;
+    let rest_fill = with_alpha(gpui::white(), 0.0);
+    let hover_fill = with_alpha(gpui::white(), if is_dark { 0.13 } else { 0.72 });
+    let rest_border = with_alpha(
+        if is_dark {
+            gpui::white()
+        } else {
+            gpui::black()
+        },
+        0.0,
+    );
+    let hover_border = with_alpha(
+        if is_dark {
+            gpui::white()
+        } else {
+            gpui::black()
+        },
+        if is_dark { 0.24 } else { 0.12 },
+    );
+
+    let visual = track.animate(
+        div()
+            .relative()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size_full()
+            .rounded_full()
+            .border_1(),
+        220,
+        ease_out_cubic,
+        move |d, t| {
+            let tc = t.clamp(0.0, 1.0);
+            let glyph_color = mix_hsla(muted, text, tc);
+            d.bg(mix_hsla(rest_fill, hover_fill, tc))
+                .border_color(mix_hsla(rest_border, hover_border, tc))
+                .shadow(glass_shadow(is_dark, 0.0, tc))
+                .when(tc > 0.01, |d| {
+                    d.child(liquid_highlights(radius, is_dark, 0.0, tc))
+                })
+                .child(div().relative().child(icon(glyph).text_color(glyph_color)))
+        },
+    );
+
     div()
         .id(id)
-        .group("icon-button")
         .flex()
         .flex_none()
-        .items_center()
-        .justify_center()
-        .size(px(28.))
-        .rounded(radius::MD)
+        .size(box_size)
+        .rounded_full()
         .cursor_pointer()
-        .hover(move |s| s.bg(hover))
         .active(|s| s.opacity(0.8))
-        .child(
-            icon(glyph)
-                .text_color(muted)
-                .group_hover("icon-button", move |s| s.text_color(text)),
-        )
+        .on_hover(track.on_hover())
         .on_click(on_click)
+        .child(visual)
+        .into_any_element()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -174,54 +422,153 @@ pub enum ButtonKind {
     Ghost,
 }
 
+/// Rounded liquid-glass capsule button: frosted transparency, monochromatic
+/// top catchlight, soft diffused shadow and fluid specular sweep on hover.
 pub fn button(
-    id: impl Into<ElementId>,
+    id: impl Into<SharedString>,
     label: impl Into<SharedString>,
     kind: ButtonKind,
     theme: &Theme,
+    window: &mut Window,
+    cx: &mut App,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> Stateful<Div> {
-    let (bg, fg, border, hover_bg) = match kind {
+) -> AnyElement {
+    let id: SharedString = id.into();
+    let label: SharedString = label.into();
+    let track = hover_track(id.clone(), theme.reduce_motion, window, cx);
+    let is_dark = theme.is_dark;
+    let liquid = theme.liquid();
+    let use_native = theme.native_glass && kind != ButtonKind::Ghost;
+    let glass_theme = theme.clone();
+    let glass_key = SharedString::from(format!("{id}-lg"));
+
+    let (bg, hover_bg, fg, hover_fg, border, hover_border, base_highlight, base_shadow) = match kind
+    {
         ButtonKind::Secondary => (
-            theme.control,
+            if use_native {
+                with_alpha(gpui::white(), if is_dark { 0.04 } else { 0.25 })
+            } else if is_dark {
+                with_alpha(gpui::white(), 0.075)
+            } else {
+                with_alpha(gpui::white(), 0.65)
+            },
+            if use_native {
+                with_alpha(gpui::white(), if is_dark { 0.14 } else { 0.55 })
+            } else if is_dark {
+                with_alpha(gpui::white(), 0.15)
+            } else {
+                with_alpha(gpui::white(), 0.88)
+            },
             theme.text,
-            theme.border_strong,
-            theme.control_hover,
+            theme.text,
+            with_alpha(
+                if is_dark {
+                    gpui::white()
+                } else {
+                    gpui::black()
+                },
+                if is_dark { 0.15 } else { 0.1 },
+            ),
+            with_alpha(
+                if is_dark {
+                    gpui::white()
+                } else {
+                    gpui::black()
+                },
+                if is_dark { 0.34 } else { 0.18 },
+            ),
+            1.0,
+            0.35,
         ),
         ButtonKind::Danger => (
-            theme.control,
+            if is_dark {
+                with_alpha(gpui::white(), 0.06)
+            } else {
+                with_alpha(gpui::white(), 0.6)
+            },
+            if is_dark {
+                with_alpha(gpui::white(), 0.13)
+            } else {
+                with_alpha(gpui::white(), 0.85)
+            },
             theme.danger,
-            theme.border_strong,
-            theme.control_hover,
+            theme.danger,
+            with_alpha(
+                if is_dark {
+                    gpui::white()
+                } else {
+                    gpui::black()
+                },
+                if is_dark { 0.14 } else { 0.1 },
+            ),
+            with_alpha(theme.danger, 0.5),
+            0.85,
+            0.3,
         ),
         ButtonKind::Ghost => (
-            with_alpha(theme.control, 0.),
+            with_alpha(gpui::white(), 0.0),
+            with_alpha(gpui::white(), if is_dark { 0.1 } else { 0.65 }),
             theme.text_muted,
-            with_alpha(theme.control, 0.),
-            theme.surface_hover,
+            theme.text,
+            with_alpha(gpui::white(), 0.0),
+            with_alpha(
+                if is_dark {
+                    gpui::white()
+                } else {
+                    gpui::black()
+                },
+                if is_dark { 0.22 } else { 0.12 },
+            ),
+            0.0,
+            0.0,
         ),
     };
+
+    let pill_radius = px(17.);
+    let visual = track.animate(
+        div()
+            .relative()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(px(6.))
+            .h_full()
+            .px(px(16.))
+            .rounded_full()
+            .border_1()
+            .text_size(px(13.))
+            .font_weight(FontWeight::MEDIUM),
+        230,
+        ease_out_cubic,
+        move |d, t| {
+            let tc = t.clamp(0.0, 1.0);
+            d.bg(mix_hsla(bg, hover_bg, tc))
+                .border_color(mix_hsla(border, hover_border, tc))
+                .text_color(mix_hsla(fg, hover_fg, tc))
+                .shadow(glass_shadow(is_dark, base_shadow, tc))
+                .when(liquid || tc > 0.01 || base_highlight > 0.0, |d| {
+                    d.child(liquid_highlights(pill_radius, is_dark, base_highlight, tc))
+                })
+                .child(div().relative().child(label.clone()))
+        },
+    );
+
     div()
         .id(id)
+        .relative()
         .flex()
         .flex_none()
-        .items_center()
-        .justify_center()
-        .gap(px(6.))
-        .h(px(32.))
-        .px(px(12.))
-        .rounded(radius::MD)
-        .border_1()
-        .border_color(border)
-        .bg(bg)
-        .text_color(fg)
-        .text_size(px(13.))
-        .font_weight(FontWeight::MEDIUM)
+        .h(px(34.))
+        .rounded_full()
         .cursor_pointer()
-        .hover(move |s| s.bg(hover_bg))
-        .active(|s| s.opacity(0.85))
-        .child(label.into())
+        .active(|s| s.opacity(0.84))
+        .on_hover(track.on_hover())
         .on_click(on_click)
+        .when(use_native, |d| {
+            d.child(glass_styled(glass_key, pill_radius, true, &glass_theme))
+        })
+        .child(visual)
+        .into_any_element()
 }
 
 /// iOS-style switch.
@@ -230,7 +577,7 @@ pub fn toggle(
     on: bool,
     theme: &Theme,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> Stateful<Div> {
+) -> gpui::Stateful<Div> {
     let track = if on {
         theme.accent
     } else {
@@ -397,10 +744,94 @@ pub struct SegmentOption {
     pub on_click: ClickHandler,
 }
 
-/// Pill-shaped segmented control.
-pub fn segmented(id: impl Into<SharedString>, theme: &Theme, options: Vec<SegmentOption>) -> Div {
+/// Pill-shaped segmented control with fluid hover transitions.
+pub fn segmented(
+    id: impl Into<SharedString>,
+    theme: &Theme,
+    window: &mut Window,
+    cx: &mut App,
+    options: Vec<SegmentOption>,
+) -> Div {
     let id: SharedString = id.into();
     let liquid = theme.liquid();
+    let mut items = Vec::with_capacity(options.len());
+    for (ix, opt) in options.into_iter().enumerate() {
+        let seg_id = SharedString::from(format!("{id}-{ix}"));
+        let track = hover_track(seg_id.clone(), theme.reduce_motion, window, cx);
+        let selected = opt.selected;
+        let is_dark = theme.is_dark;
+        let selected_bg = theme.selected_bg;
+        let hover_bg = with_alpha(gpui::white(), if is_dark { 0.09 } else { 0.55 });
+        let rest_bg = with_alpha(gpui::white(), 0.0);
+        let text = theme.text;
+        let muted = theme.text_muted;
+        let shadow = (!liquid).then(|| theme.card_shadow());
+        let glyph = opt.icon;
+        let label = opt.label;
+
+        let item = if selected {
+            div()
+                .id(seg_id)
+                .relative()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .h(px(28.))
+                .px(px(14.))
+                .rounded_full()
+                .text_size(px(13.))
+                .font_weight(FontWeight::MEDIUM)
+                .cursor_pointer()
+                .bg(selected_bg)
+                .text_color(text)
+                .when_some(shadow, |d, s| d.shadow(s))
+                .child(liquid_highlights(px(14.), is_dark, 0.65, 0.0))
+                .when_some(glyph, |d, g| d.child(icon(g).size(px(14.)).text_color(text)))
+                .child(div().relative().child(label))
+                .on_click(opt.on_click)
+                .into_any_element()
+        } else {
+            let visual = track.animate(
+                div()
+                    .relative()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .h_full()
+                    .px(px(14.))
+                    .rounded_full()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::MEDIUM),
+                210,
+                ease_out_cubic,
+                move |d, t| {
+                    let tc = t.clamp(0.0, 1.0);
+                    let fg = mix_hsla(muted, text, tc);
+                    d.bg(mix_hsla(rest_bg, hover_bg, tc))
+                        .text_color(fg)
+                        .when(tc > 0.01, |d| {
+                            d.child(liquid_highlights(px(14.), is_dark, 0.0, tc * 0.7))
+                        })
+                        .when_some(glyph, |d, g| d.child(icon(g).size(px(14.)).text_color(fg)))
+                        .child(div().relative().child(label.clone()))
+                },
+            );
+            div()
+                .id(seg_id)
+                .h(px(28.))
+                .rounded_full()
+                .cursor_pointer()
+                .on_hover(track.on_hover())
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, _| {
+                    native::haptic(Haptic::Alignment)
+                })
+                .on_click(opt.on_click)
+                .child(visual)
+                .into_any_element()
+        };
+        items.push(item);
+    }
+
     div()
         .relative()
         .flex()
@@ -423,39 +854,7 @@ pub fn segmented(id: impl Into<SharedString>, theme: &Theme, options: Vec<Segmen
                 .border_color(theme.border)
             }
         })
-        .children(options.into_iter().enumerate().map(|(ix, opt)| {
-            let hover = theme.surface_hover;
-            div()
-                .id(SharedString::from(format!("{id}-{ix}")))
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .h(px(28.))
-                .px(px(14.))
-                .rounded_full()
-                .text_size(px(13.))
-                .font_weight(FontWeight::MEDIUM)
-                .cursor_pointer()
-                .map(|d| {
-                    if opt.selected {
-                        d.bg(theme.selected_bg)
-                            .text_color(theme.text)
-                            .when(!liquid, |d| d.shadow(theme.card_shadow()))
-                    } else {
-                        d.text_color(theme.text_muted).hover(move |s| s.bg(hover))
-                    }
-                })
-                .when_some(opt.icon, |d, glyph| {
-                    d.child(icon(glyph).size(px(14.)).text_color(theme.text_muted))
-                })
-                .child(opt.label)
-                .when(!opt.selected, |d| {
-                    d.on_mouse_down(gpui::MouseButton::Left, |_, _, _| {
-                        native::haptic(Haptic::Alignment)
-                    })
-                })
-                .on_click(opt.on_click)
-        }))
+        .children(items)
 }
 
 pub fn keycap(theme: &Theme, key: impl Into<SharedString>) -> Div {

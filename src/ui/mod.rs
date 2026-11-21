@@ -9,6 +9,7 @@ mod stats_page;
 mod tasks_page;
 pub mod text_input;
 mod timer_page;
+mod wrapped_page;
 
 use gpui::{App, ClickEvent, Context, Entity, Window};
 

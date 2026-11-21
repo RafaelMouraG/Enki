@@ -6,7 +6,7 @@
 use std::{collections::HashMap, path::Path};
 
 use anyhow::Result;
-use chrono::{DateTime, Duration as Days, Local, NaiveDate};
+use chrono::{DateTime, Datelike as _, Duration as Days, Local, NaiveDate, TimeZone as _};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::timer::Phase;
@@ -83,11 +83,102 @@ impl Stats {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WrappedPeriod {
+    Week,
+    #[default]
+    Month,
+    Year,
+    All,
+}
+
+impl WrappedPeriod {
+    pub const ALL: [WrappedPeriod; 4] = [
+        WrappedPeriod::Week,
+        WrappedPeriod::Month,
+        WrappedPeriod::Year,
+        WrappedPeriod::All,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            WrappedPeriod::Week => "7 dias",
+            WrappedPeriod::Month => "Este mês",
+            WrappedPeriod::Year => "Este ano",
+            WrappedPeriod::All => "Tudo",
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            WrappedPeriod::Week => "Últimos 7 dias",
+            WrappedPeriod::Month => "Este mês",
+            WrappedPeriod::Year => "Este ano",
+            WrappedPeriod::All => "Todo o período",
+        }
+    }
+
+    fn since_timestamp(self, today: NaiveDate) -> Option<i64> {
+        let start_date = match self {
+            WrappedPeriod::Week => today - Days::days(6),
+            WrappedPeriod::Month => today.with_day(1).unwrap_or(today),
+            WrappedPeriod::Year => NaiveDate::from_ymd_opt(today.year(), 1, 1).unwrap_or(today),
+            WrappedPeriod::All => return None,
+        };
+        let midnight = start_date.and_hms_opt(0, 0, 0)?;
+        Local
+            .from_local_datetime(&midnight)
+            .earliest()
+            .map(|dt| dt.timestamp())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListenRecord {
+    pub title: String,
+    pub artist: String,
+    pub player: String,
+    pub art_path: Option<String>,
+    pub started_at: i64,
+    pub seconds: u64,
+    pub during_focus: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TopTrack {
+    pub title: String,
+    pub artist: String,
+    pub art_path: Option<String>,
+    pub plays: u32,
+    pub seconds: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TopArtist {
+    pub artist: String,
+    pub art_path: Option<String>,
+    pub plays: u32,
+    pub seconds: u64,
+    pub distinct_tracks: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MusicWrapped {
+    pub total_seconds: u64,
+    pub focus_seconds: u64,
+    pub total_plays: u32,
+    pub distinct_tracks: u32,
+    pub distinct_artists: u32,
+    pub top_tracks: Vec<TopTrack>,
+    pub top_artists: Vec<TopArtist>,
+    pub top_player: Option<String>,
+}
+
 pub struct Store {
     conn: Connection,
 }
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
@@ -132,6 +223,23 @@ impl Store {
                     deleted INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS sessions_started ON sessions(started_at);",
+            )?;
+        }
+        if version < 2 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS listens (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    artist TEXT NOT NULL,
+                    player TEXT NOT NULL,
+                    art_path TEXT,
+                    started_at INTEGER NOT NULL,
+                    seconds INTEGER NOT NULL,
+                    during_focus INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL,
+                    deleted INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS listens_started ON listens(started_at);",
             )?;
         }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -507,6 +615,178 @@ impl Store {
             completed_focus,
             skipped_focus,
             prev_week_focus_seconds,
+        })
+    }
+
+    pub fn record_listen(&self, listen: &ListenRecord) -> Result<()> {
+        let title = listen.title.trim();
+        if title.is_empty() || listen.seconds == 0 {
+            return Ok(());
+        }
+        let artist = listen.artist.trim();
+        let player = listen.player.trim();
+        let updated_at = now();
+        self.conn.execute(
+            "INSERT INTO listens
+               (id, title, artist, player, art_path, started_at, seconds, during_focus, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                title,
+                artist,
+                if player.is_empty() { "Player" } else { player },
+                listen.art_path,
+                listen.started_at,
+                listen.seconds as i64,
+                listen.during_focus,
+                updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_listens(&self) -> Result<()> {
+        self.conn.execute(
+            "UPDATE listens SET deleted = 1, updated_at = ?1 WHERE deleted = 0",
+            params![now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn music_wrapped(&self, period: WrappedPeriod, focus_only: bool) -> Result<MusicWrapped> {
+        let today = Local::now().date_naive();
+        self.music_wrapped_until(today, period, focus_only)
+    }
+
+    fn music_wrapped_until(
+        &self,
+        today: NaiveDate,
+        period: WrappedPeriod,
+        focus_only: bool,
+    ) -> Result<MusicWrapped> {
+        let since = period.since_timestamp(today);
+        let focus_flag = i64::from(focus_only);
+
+        let (total_seconds, focus_seconds, total_plays, distinct_tracks, distinct_artists): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = self.conn.query_row(
+            "SELECT
+                COALESCE(SUM(seconds), 0),
+                COALESCE(SUM(CASE WHEN during_focus THEN seconds ELSE 0 END), 0),
+                COUNT(*),
+                COUNT(DISTINCT lower(title) || char(31) || lower(artist)),
+                COUNT(DISTINCT CASE WHEN artist != '' THEN lower(artist) END)
+             FROM listens
+             WHERE deleted = 0
+               AND (?1 IS NULL OR started_at >= ?1)
+               AND (?2 = 0 OR during_focus = 1)",
+            params![since, focus_flag],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?;
+
+        if total_plays == 0 {
+            return Ok(MusicWrapped::default());
+        }
+
+        let mut track_stmt = self.conn.prepare(
+            "SELECT
+                MIN(title),
+                MIN(artist),
+                (SELECT l2.art_path FROM listens l2
+                 WHERE l2.deleted = 0
+                   AND (?1 IS NULL OR l2.started_at >= ?1)
+                   AND (?2 = 0 OR l2.during_focus = 1)
+                   AND lower(l2.title) = lower(l.title)
+                   AND lower(l2.artist) = lower(l.artist)
+                   AND l2.art_path IS NOT NULL
+                 ORDER BY l2.started_at DESC
+                 LIMIT 1),
+                COUNT(*),
+                SUM(seconds)
+             FROM listens l
+             WHERE l.deleted = 0
+               AND (?1 IS NULL OR l.started_at >= ?1)
+               AND (?2 = 0 OR l.during_focus = 1)
+             GROUP BY lower(l.title), lower(l.artist)
+             ORDER BY SUM(l.seconds) DESC, COUNT(*) DESC, MIN(l.title) ASC
+             LIMIT 5",
+        )?;
+        let top_tracks = track_stmt
+            .query_map(params![since, focus_flag], |r| {
+                Ok(TopTrack {
+                    title: r.get(0)?,
+                    artist: r.get(1)?,
+                    art_path: r.get(2)?,
+                    plays: r.get::<_, i64>(3)?.max(0) as u32,
+                    seconds: r.get::<_, i64>(4)?.max(0) as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut artist_stmt = self.conn.prepare(
+            "SELECT
+                MIN(artist),
+                (SELECT l2.art_path FROM listens l2
+                 WHERE l2.deleted = 0
+                   AND (?1 IS NULL OR l2.started_at >= ?1)
+                   AND (?2 = 0 OR l2.during_focus = 1)
+                   AND lower(l2.artist) = lower(l.artist)
+                   AND l2.art_path IS NOT NULL
+                 ORDER BY l2.started_at DESC
+                 LIMIT 1),
+                COUNT(*),
+                SUM(seconds),
+                COUNT(DISTINCT lower(title))
+             FROM listens l
+             WHERE l.deleted = 0
+               AND l.artist != ''
+               AND (?1 IS NULL OR l.started_at >= ?1)
+               AND (?2 = 0 OR l.during_focus = 1)
+             GROUP BY lower(l.artist)
+             ORDER BY SUM(l.seconds) DESC, COUNT(*) DESC, MIN(l.artist) ASC
+             LIMIT 5",
+        )?;
+        let top_artists = artist_stmt
+            .query_map(params![since, focus_flag], |r| {
+                Ok(TopArtist {
+                    artist: r.get(0)?,
+                    art_path: r.get(1)?,
+                    plays: r.get::<_, i64>(2)?.max(0) as u32,
+                    seconds: r.get::<_, i64>(3)?.max(0) as u64,
+                    distinct_tracks: r.get::<_, i64>(4)?.max(0) as u32,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let top_player: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT player
+                 FROM listens
+                 WHERE deleted = 0
+                   AND (?1 IS NULL OR started_at >= ?1)
+                   AND (?2 = 0 OR during_focus = 1)
+                 GROUP BY player
+                 ORDER BY SUM(seconds) DESC, COUNT(*) DESC
+                 LIMIT 1",
+                params![since, focus_flag],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        Ok(MusicWrapped {
+            total_seconds: total_seconds.max(0) as u64,
+            focus_seconds: focus_seconds.max(0) as u64,
+            total_plays: total_plays.max(0) as u32,
+            distinct_tracks: distinct_tracks.max(0) as u32,
+            distinct_artists: distinct_artists.max(0) as u32,
+            top_tracks,
+            top_artists,
+            top_player,
         })
     }
 
@@ -919,5 +1199,130 @@ mod tests {
              {expected_break_start},{expected_break_end},short_break,1.5,true,,\"Alongar\nrespirar\"\r\n"
         );
         assert_eq!(csv, expected);
+    }
+
+    fn ts_on(date: NaiveDate, hour: u32) -> i64 {
+        Local
+            .from_local_datetime(&date.and_hms_opt(hour, 0, 0).unwrap())
+            .earliest()
+            .unwrap()
+            .timestamp()
+    }
+
+    #[test]
+    fn migrates_v1_database_to_v2_with_listens() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0,
+              estimate INTEGER NOT NULL DEFAULT 1, pomodoros INTEGER NOT NULL DEFAULT 0, position REAL NOT NULL,
+              created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, done_at INTEGER, deleted INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE sessions (id TEXT PRIMARY KEY, phase TEXT NOT NULL, started_at INTEGER NOT NULL,
+              ended_at INTEGER NOT NULL, seconds INTEGER NOT NULL, completed INTEGER NOT NULL, task_id TEXT,
+              intention TEXT, updated_at INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0);
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        let store = Store::init(conn).unwrap();
+        let version: i32 = store
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        store
+            .record_listen(&ListenRecord {
+                title: "Time".into(),
+                artist: "Hans Zimmer".into(),
+                player: "Spotify".into(),
+                art_path: None,
+                started_at: 1_700_000_000,
+                seconds: 240,
+                during_focus: true,
+            })
+            .unwrap();
+        let wrapped = store.music_wrapped(WrappedPeriod::All, true).unwrap();
+        assert_eq!(wrapped.total_plays, 1);
+        assert_eq!(wrapped.total_seconds, 240);
+    }
+
+    #[test]
+    fn music_wrapped_periods_focus_filter_and_ranking() {
+        let store = Store::open_in_memory().unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 11, 20).unwrap();
+
+        let add = |title: &str,
+                   artist: &str,
+                   player: &str,
+                   art: Option<&str>,
+                   date: NaiveDate,
+                   seconds: u64,
+                   during_focus: bool| {
+            store
+                .record_listen(&ListenRecord {
+                    title: title.into(),
+                    artist: artist.into(),
+                    player: player.into(),
+                    art_path: art.map(Into::into),
+                    started_at: ts_on(date, 10),
+                    seconds,
+                    during_focus,
+                })
+                .unwrap();
+        };
+
+        // Within last 7 days (focus).
+        add("Cornfield Chase", "Hans Zimmer", "Spotify", Some("/art/1.jpg"), today, 180, true);
+        add("cornfield chase", "hans zimmer", "Spotify", Some("/art/2.jpg"), today - Days::days(2), 180, true);
+        add("Nuvole Bianche", "Ludovico Einaudi", "Spotify", None, today - Days::days(3), 300, true);
+        // Within last 7 days (not during focus).
+        add("Chill Track", "Lo-Fi Girl", "Apple Music", None, today - Days::days(1), 600, false);
+        // Earlier this month (> 7 days ago, same month Nov).
+        add("Time", "Hans Zimmer", "Spotify", None, NaiveDate::from_ymd_opt(2026, 11, 2).unwrap(), 240, true);
+        // Earlier this year (Oct).
+        add("Experience", "Ludovico Einaudi", "Spotify", None, NaiveDate::from_ymd_opt(2026, 10, 5).unwrap(), 400, true);
+        // Previous year.
+        add("Old Song", "Archive", "Spotify", None, NaiveDate::from_ymd_opt(2025, 8, 1).unwrap(), 900, true);
+
+        // Week, focus only: Cornfield Chase (360s, 2 plays), Nuvole Bianche (300s, 1 play).
+        let week_focus = store.music_wrapped_until(today, WrappedPeriod::Week, true).unwrap();
+        assert_eq!(week_focus.total_seconds, 660);
+        assert_eq!(week_focus.focus_seconds, 660);
+        assert_eq!(week_focus.total_plays, 3);
+        assert_eq!(week_focus.distinct_tracks, 2);
+        assert_eq!(week_focus.distinct_artists, 2);
+        assert_eq!(week_focus.top_player.as_deref(), Some("Spotify"));
+        assert_eq!(week_focus.top_tracks[0].plays, 2);
+        assert_eq!(week_focus.top_tracks[0].seconds, 360);
+        assert_eq!(week_focus.top_tracks[0].art_path.as_deref(), Some("/art/1.jpg"));
+        assert_eq!(week_focus.top_artists[0].artist.to_lowercase(), "hans zimmer");
+
+        // Week, all listens: Lo-Fi Girl leads with 600s.
+        let week_all = store.music_wrapped_until(today, WrappedPeriod::Week, false).unwrap();
+        assert_eq!(week_all.total_seconds, 1260);
+        assert_eq!(week_all.focus_seconds, 660);
+        assert_eq!(week_all.top_artists[0].artist, "Lo-Fi Girl");
+
+        // Month, focus only: includes "Time" (Nov 2) -> Hans Zimmer has 2 distinct tracks, 600s.
+        let month_focus = store.music_wrapped_until(today, WrappedPeriod::Month, true).unwrap();
+        assert_eq!(month_focus.total_seconds, 900);
+        assert_eq!(month_focus.top_artists[0].distinct_tracks, 2);
+        assert_eq!(month_focus.top_artists[0].seconds, 600);
+
+        // Year, focus only: includes Oct Experience -> Ludovico Einaudi leads with 700s.
+        let year_focus = store.music_wrapped_until(today, WrappedPeriod::Year, true).unwrap();
+        assert_eq!(year_focus.total_seconds, 1300);
+        assert_eq!(year_focus.top_artists[0].artist, "Ludovico Einaudi");
+        assert_eq!(year_focus.top_artists[0].seconds, 700);
+
+        // All, focus only: includes 2025 Old Song (900s).
+        let all_focus = store.music_wrapped_until(today, WrappedPeriod::All, true).unwrap();
+        assert_eq!(all_focus.total_seconds, 2200);
+        assert_eq!(all_focus.top_artists[0].artist, "Archive");
+
+        // Clearing listens hides them all.
+        store.clear_listens().unwrap();
+        assert_eq!(
+            store.music_wrapped_until(today, WrappedPeriod::All, false).unwrap().total_plays,
+            0
+        );
     }
 }

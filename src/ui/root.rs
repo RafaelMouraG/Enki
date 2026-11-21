@@ -18,7 +18,7 @@ use crate::{
         components::{icon, icon_button, icon_sized, WindowDrag},
         on_model, settings_page, sidebar, stats_page, tasks_page,
         text_input::{TextInput, TextInputEvent},
-        timer_page,
+        timer_page, wrapped_page,
     },
 };
 
@@ -131,13 +131,34 @@ impl RootView {
         &self,
         title: AnyElement,
         sidebar_open: bool,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let theme = Theme::get(cx);
+        let theme = Theme::get(cx).clone();
         let model = self.model.clone();
         let client_decorated = matches!(window.window_decorations(), Decorations::Client { .. });
         let lights = cfg!(target_os = "macos");
+
+        let sidebar_btn = (!sidebar_open).then(|| {
+            icon_button(
+                "titlebar-sidebar",
+                Icon::PanelLeft,
+                &theme,
+                window,
+                cx,
+                on_model(&model, |m, cx| {
+                    m.update_settings(cx, |s| s.sidebar_open = !s.sidebar_open)
+                }),
+            )
+        });
+        let mini_btn = icon_button(
+            "titlebar-mini",
+            Icon::Mini,
+            &theme,
+            window,
+            cx,
+            |_, _, cx| crate::toggle_mini_window(cx),
+        );
 
         div()
             .id("titlebar")
@@ -164,25 +185,11 @@ impl RootView {
                     }
                 }
             })
-            .when(!sidebar_open, |d| {
-                d.child(icon_button(
-                    "titlebar-sidebar",
-                    Icon::PanelLeft,
-                    theme,
-                    on_model(&model, |m, cx| {
-                        m.update_settings(cx, |s| s.sidebar_open = !s.sidebar_open)
-                    }),
-                ))
-            })
+            .children(sidebar_btn)
             .child(title)
             .child(div().flex_1())
-            .child(icon_button(
-                "titlebar-mini",
-                Icon::Mini,
-                theme,
-                |_, _, cx| crate::toggle_mini_window(cx),
-            ))
-            .when(client_decorated, |d| d.child(window_controls(theme)))
+            .child(mini_btn)
+            .when(client_decorated, |d| d.child(window_controls(&theme)))
     }
 
     fn page_title(&self, cx: &App) -> AnyElement {
@@ -201,6 +208,7 @@ impl RootView {
             },
             Page::Tasks => (Icon::ListChecks, "Tarefas".into()),
             Page::Stats => (Icon::Chart, "Estatísticas".into()),
+            Page::Wrapped => (Icon::Music, "Wrapped".into()),
             Page::Settings(section) => (
                 Icon::Settings,
                 format!("Configurações · {}", section.label()).into(),
@@ -499,6 +507,7 @@ impl Render for RootView {
             Page::Timer => timer_page::render(self, window, cx),
             Page::Tasks => tasks_page::render(self, window, cx),
             Page::Stats => stats_page::render(self, window, cx),
+            Page::Wrapped => wrapped_page::render(self, window, cx),
             Page::Settings(section) => settings_page::render(self, section, window, cx),
         };
         let sidebar = sidebar_open.then(|| sidebar::render(self, window, cx));

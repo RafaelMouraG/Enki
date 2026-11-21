@@ -37,17 +37,25 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
     let hovered_bar = *bars_hover.read(cx);
     let hovered_heatmap = *heatmap_hover.read(cx);
 
-    let theme = Theme::get(cx);
-    let enki = model.read(cx);
-    let stats = &enki.stats;
-    let today_stat = stats.today();
-    let today_date = stats
-        .days
-        .last()
-        .map(|(d, _)| *d)
-        .unwrap_or_else(|| Local::now().date_naive());
-    let goal = enki.settings.daily_goal.max(1);
-    let recent_sessions: Vec<SessionItem> = enki.recent_sessions.clone();
+    let theme = Theme::get(cx).clone();
+    let theme = &theme;
+    let (stats, today_stat, today_date, goal, recent_sessions) = {
+        let enki = model.read(cx);
+        let stats = enki.stats.clone();
+        let today_stat = stats.today();
+        let today_date = stats
+            .days
+            .last()
+            .map(|(d, _)| *d)
+            .unwrap_or_else(|| Local::now().date_naive());
+        (
+            stats,
+            today_stat,
+            today_date,
+            enki.settings.daily_goal.max(1),
+            enki.recent_sessions.clone(),
+        )
+    };
 
     let export_csv = {
         let model = model.clone();
@@ -103,6 +111,28 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
         }
     };
 
+    let add_manual_btn = button(
+        "stats-add-manual",
+        "+ Registrar foco",
+        ButtonKind::Secondary,
+        theme,
+        window,
+        cx,
+        on_model(&model, |m, cx| {
+            let minutes = m.settings.focus_minutes;
+            m.add_manual_session(minutes, cx);
+        }),
+    );
+    let export_csv_btn = button(
+        "stats-export-csv",
+        "Exportar CSV",
+        ButtonKind::Secondary,
+        theme,
+        window,
+        cx,
+        export_csv,
+    );
+
     let header = div()
         .flex()
         .flex_wrap()
@@ -115,23 +145,8 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
                 .flex()
                 .items_center()
                 .gap(px(8.))
-                .child(button(
-                    "stats-add-manual",
-                    "+ Registrar foco",
-                    ButtonKind::Secondary,
-                    theme,
-                    on_model(&model, |m, cx| {
-                        let minutes = m.settings.focus_minutes;
-                        m.add_manual_session(minutes, cx);
-                    }),
-                ))
-                .child(button(
-                    "stats-export-csv",
-                    "Exportar CSV",
-                    ButtonKind::Secondary,
-                    theme,
-                    export_csv,
-                )),
+                .child(add_manual_btn)
+                .child(export_csv_btn),
         );
 
     let tile = |glyph: Icon, label: &'static str, value: String, hint: String, color: Hsla| {

@@ -182,6 +182,7 @@ pub struct Settings {
     // Integrations
     pub menu_bar: bool,
     pub now_playing: bool,
+    pub track_music: bool,
     pub mini_on_top: bool,
 }
 
@@ -209,6 +210,7 @@ impl Default for Settings {
             sound: Sound::Chime,
             menu_bar: true,
             now_playing: true,
+            track_music: true,
             mini_on_top: true,
         }
     }

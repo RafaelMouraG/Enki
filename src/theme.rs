@@ -9,6 +9,7 @@ use crate::settings::{ColorScheme, Glass, Settings};
 #[derive(Clone, Debug)]
 pub struct Theme {
     pub is_dark: bool,
+    pub reduce_motion: bool,
     /// Glass surfaces are real macOS Liquid Glass views under GPUI's content.
     pub native_glass: bool,
     /// Glass surfaces are drawn: translucent fill plus a lit rim.
@@ -115,6 +116,7 @@ impl Theme {
             };
             Theme {
                 is_dark,
+                reduce_motion: settings.reduce_motion,
                 native_glass,
                 drawn_glass,
                 window_bg: t(0x14181d),
@@ -159,6 +161,7 @@ impl Theme {
             let accent_text = darken_for_light(accent);
             Theme {
                 is_dark,
+                reduce_motion: settings.reduce_motion,
                 native_glass,
                 drawn_glass,
                 window_bg: t(0xffffff),
@@ -267,6 +270,19 @@ pub fn mix(a: Rgba, b: Rgba, amount: f32) -> Rgba {
         b: a.b + (b.b - a.b) * t,
         a: a.a + (b.a - a.a) * t,
     }
+}
+
+/// Blends two `Hsla` colors in RGBA space so transitions never sweep through unrelated hues.
+pub fn mix_hsla(a: Hsla, b: Hsla, amount: f32) -> Hsla {
+    let t = amount.clamp(0.0, 1.0);
+    let mut ra = a.to_rgb();
+    let mut rb = b.to_rgb();
+    ra.a = a.a;
+    rb.a = b.a;
+    let mixed = mix(ra, rb, t);
+    let mut out: Hsla = mixed.into();
+    out.a = mixed.a;
+    out
 }
 
 fn lighten(mut c: Hsla, by: f32) -> Hsla {

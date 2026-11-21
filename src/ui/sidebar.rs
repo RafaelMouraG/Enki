@@ -1,16 +1,19 @@
 //! Left column: navigation, task list, now playing and the footer.
 
 use gpui::{
-    div, prelude::*, px, AnyElement, Context, Decorations, FontWeight, SharedString, Window,
+    div, prelude::*, px, AnyElement, App, ClickEvent, Context, Decorations, FontWeight,
+    SharedString, Window,
 };
 
 use crate::{
     assets::Icon,
     state::{Page, SettingsSection},
-    theme::{radius, sidebar_width, with_alpha, Theme},
+    theme::{mix_hsla, radius, sidebar_width, with_alpha, Theme},
     ui::{
-        components::StyledExt as _,
-        components::{glass, icon, icon_button, icon_sized},
+        components::{
+            ease_out_cubic, glass, glass_shadow, hover_track, icon, icon_button, icon_button_sized,
+            icon_sized, liquid_highlights, StyledExt as _,
+        },
         on_model, player,
         root::{RootView, TITLEBAR_HEIGHT, TRAFFIC_LIGHTS_WIDTH},
     },
@@ -21,12 +24,22 @@ const FLOAT_RADIUS: gpui::Pixels = px(18.);
 
 pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootView>) -> AnyElement {
     let model = view.model.clone();
-    let theme = Theme::get(cx);
-    let enki = model.read(cx);
-    let in_settings = matches!(enki.page, Page::Settings(_));
+    let theme = Theme::get(cx).clone();
+    let in_settings = matches!(model.read(cx).page, Page::Settings(_));
     // The liquid sidebar floats inset from the window edges.
     let inset = if theme.liquid() { FLOAT_INSET } else { 0. };
     let client_decorated = matches!(window.window_decorations(), Decorations::Client { .. });
+
+    let toggle_btn = icon_button(
+        "sidebar-toggle",
+        Icon::PanelLeft,
+        &theme,
+        window,
+        cx,
+        on_model(&model, |m, cx| {
+            m.update_settings(cx, |s| s.sidebar_open = false)
+        }),
+    );
 
     let header = div()
         .flex()
@@ -42,23 +55,15 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
         .pr(px(10.))
         .window_control_area(gpui::WindowControlArea::Drag)
         .when(client_decorated, |d| view.drag.attach(d))
-        .child(icon_button(
-            "sidebar-toggle",
-            Icon::PanelLeft,
-            theme,
-            on_model(&model, |m, cx| {
-                m.update_settings(cx, |s| s.sidebar_open = false)
-            }),
-        ))
+        .child(toggle_btn)
         .child(div().flex_1());
 
     let body = if in_settings {
-        settings_nav(view, cx)
+        settings_nav(view, window, cx)
     } else {
-        main_nav(view, cx)
+        main_nav(view, window, cx)
     };
 
-    let theme = Theme::get(cx);
     div()
         .id("sidebar")
         .relative()
@@ -70,7 +75,7 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
                 // The same gap on every side, so it doesn't lean on the content.
                 d.w(sidebar_width() - px(2. * inset))
                     .m(px(inset))
-                    .child(glass("sidebar", FLOAT_RADIUS, theme))
+                    .child(glass("sidebar", FLOAT_RADIUS, &theme))
             } else {
                 d.w(sidebar_width()).h_full().bg(theme.sidebar_bg)
             }
@@ -80,6 +85,7 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
         .into_any_element()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn nav_item(
     id: impl Into<SharedString>,
     glyph: Icon,
@@ -87,98 +93,323 @@ fn nav_item(
     trailing: Option<SharedString>,
     selected: bool,
     theme: &Theme,
-) -> gpui::Stateful<gpui::Div> {
-    let hover = theme.surface_hover;
-    div()
-        .id(id.into())
-        .flex()
-        .items_center()
-        .gap(px(10.))
-        .h(px(34.))
-        .px(px(10.))
-        .rounded(radius::MD)
-        .cursor_pointer()
-        .text_size(px(14.))
-        .map(|d| {
-            if selected {
-                d.bg(theme.selected_bg)
-                    .text_color(theme.text)
-                    .font_weight(FontWeight::MEDIUM)
-            } else {
-                d.text_color(theme.text).hover(move |s| s.bg(hover))
-            }
-        })
-        .child(icon(glyph).text_color(if selected {
-            theme.text
+    window: &mut Window,
+    cx: &mut App,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let id: SharedString = id.into();
+    let label: SharedString = label.into();
+    let track = hover_track(id.clone(), theme.reduce_motion, window, cx);
+
+    let text = theme.text;
+    let muted = theme.text_muted;
+    let faint = theme.text_faint;
+    let is_dark = theme.is_dark;
+    let selected_bg = theme.selected_bg;
+    let hover_bg = with_alpha(gpui::white(), if is_dark { 0.1 } else { 0.65 });
+    let rest_bg = with_alpha(gpui::white(), 0.0);
+    let rest_border = with_alpha(
+        if is_dark {
+            gpui::white()
         } else {
-            theme.text_muted
-        }))
-        .child(div().flex_1().min_w_0().ellipsis().child(label.into()))
-        .when_some(trailing, |d, t| {
-            d.child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(if selected {
-                        theme.text_muted
-                    } else {
-                        theme.text_faint
-                    })
-                    .font(crate::theme::tabular_font())
-                    .child(t),
-            )
-        })
+            gpui::black()
+        },
+        0.0,
+    );
+    let hover_border = with_alpha(
+        if is_dark {
+            gpui::white()
+        } else {
+            gpui::black()
+        },
+        if is_dark { 0.2 } else { 0.1 },
+    );
+
+    if selected {
+        return div()
+            .id(id)
+            .relative()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .h(px(34.))
+            .px(px(12.))
+            .rounded_full()
+            .border_1()
+            .cursor_pointer()
+            .text_size(px(14.))
+            .bg(selected_bg)
+            .border_color(with_alpha(
+                if is_dark {
+                    gpui::white()
+                } else {
+                    gpui::black()
+                },
+                if is_dark { 0.18 } else { 0.08 },
+            ))
+            .text_color(text)
+            .font_weight(FontWeight::MEDIUM)
+            .shadow(glass_shadow(is_dark, 0.2, 0.0))
+            .on_click(on_click)
+            .child(liquid_highlights(px(17.), is_dark, 0.75, 0.0))
+            .child(div().relative().child(icon(glyph).text_color(text)))
+            .child(div().relative().flex_1().min_w_0().ellipsis().child(label))
+            .when_some(trailing, |d, t| {
+                d.child(
+                    div()
+                        .relative()
+                        .text_size(px(12.))
+                        .text_color(muted)
+                        .font(crate::theme::tabular_font())
+                        .child(t),
+                )
+            })
+            .into_any_element();
+    }
+
+    let visual = track.animate(
+        div()
+            .relative()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .size_full()
+            .px(px(12.))
+            .rounded_full()
+            .border_1()
+            .text_size(px(14.)),
+        220,
+        ease_out_cubic,
+        move |d, t| {
+            let tc = t.clamp(0.0, 1.0);
+            let glyph_color = mix_hsla(muted, text, tc);
+            d.bg(mix_hsla(rest_bg, hover_bg, tc))
+                .border_color(mix_hsla(rest_border, hover_border, tc))
+                .text_color(text)
+                .shadow(glass_shadow(is_dark, 0.0, tc * 0.7))
+                .when(tc > 0.01, |d| {
+                    d.child(liquid_highlights(px(17.), is_dark, 0.0, tc * 0.85))
+                })
+                .child(div().relative().child(icon(glyph).text_color(glyph_color)))
+                .child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_w_0()
+                        .ellipsis()
+                        .child(label.clone()),
+                )
+                .when_some(trailing.clone(), |d, trail| {
+                    d.child(
+                        div()
+                            .relative()
+                            .text_size(px(12.))
+                            .text_color(mix_hsla(faint, muted, tc))
+                            .font(crate::theme::tabular_font())
+                            .child(trail),
+                    )
+                })
+        },
+    );
+
+    div()
+        .id(id)
+        .h(px(34.))
+        .rounded_full()
+        .cursor_pointer()
+        .on_hover(track.on_hover())
+        .on_click(on_click)
+        .child(visual)
+        .into_any_element()
 }
 
-fn main_nav(view: &mut RootView, cx: &mut Context<RootView>) -> AnyElement {
+fn main_nav(view: &mut RootView, window: &mut Window, cx: &mut Context<RootView>) -> AnyElement {
     let model = view.model.clone();
-    let theme = Theme::get(cx);
-    let enki = model.read(cx);
+    let theme = Theme::get(cx).clone();
+    let (page, running_clock, open_count, tasks, current, now_playing_data, today, goal) = {
+        let enki = model.read(cx);
+        (
+            enki.page,
+            (!enki.timer.is_idle()).then(|| SharedString::from(enki.clock_text())),
+            enki.open_tasks().count(),
+            enki.open_tasks().take(8).cloned().collect::<Vec<_>>(),
+            enki.current_task.clone(),
+            enki.now_playing.clone().filter(|_| enki.page != Page::Timer),
+            enki.stats.today(),
+            enki.settings.daily_goal.max(1),
+        )
+    };
 
-    let running_clock = (!enki.timer.is_idle()).then(|| SharedString::from(enki.clock_text()));
-    let open_count = enki.open_tasks().count();
+    let nav_timer = nav_item(
+        "nav-timer",
+        Icon::Timer,
+        "Timer",
+        running_clock,
+        page == Page::Timer,
+        &theme,
+        window,
+        cx,
+        on_model(&model, |m, cx| m.navigate(Page::Timer, cx)),
+    );
+    let nav_tasks = nav_item(
+        "nav-tasks",
+        Icon::ListChecks,
+        "Tarefas",
+        (open_count > 0).then(|| open_count.to_string().into()),
+        page == Page::Tasks,
+        &theme,
+        window,
+        cx,
+        on_model(&model, |m, cx| m.navigate(Page::Tasks, cx)),
+    );
+    let nav_stats = nav_item(
+        "nav-stats",
+        Icon::Chart,
+        "Estatísticas",
+        None,
+        page == Page::Stats,
+        &theme,
+        window,
+        cx,
+        on_model(&model, |m, cx| m.navigate(Page::Stats, cx)),
+    );
+    let nav_wrapped = nav_item(
+        "nav-wrapped",
+        Icon::Music,
+        "Wrapped",
+        None,
+        page == Page::Wrapped,
+        &theme,
+        window,
+        cx,
+        on_model(&model, |m, cx| m.navigate(Page::Wrapped, cx)),
+    );
 
     let nav = div()
         .flex()
         .flex_col()
         .gap(px(2.))
         .px(px(10.))
-        .child(
-            nav_item(
-                "nav-timer",
-                Icon::Timer,
-                "Timer",
-                running_clock,
-                enki.page == Page::Timer,
-                theme,
-            )
-            .on_click(on_model(&model, |m, cx| m.navigate(Page::Timer, cx))),
-        )
-        .child(
-            nav_item(
-                "nav-tasks",
-                Icon::ListChecks,
-                "Tarefas",
-                (open_count > 0).then(|| open_count.to_string().into()),
-                enki.page == Page::Tasks,
-                theme,
-            )
-            .on_click(on_model(&model, |m, cx| m.navigate(Page::Tasks, cx))),
-        )
-        .child(
-            nav_item(
-                "nav-stats",
-                Icon::Chart,
-                "Estatísticas",
-                None,
-                enki.page == Page::Stats,
-                theme,
-            )
-            .on_click(on_model(&model, |m, cx| m.navigate(Page::Stats, cx))),
-        );
+        .child(nav_timer)
+        .child(nav_tasks)
+        .child(nav_stats)
+        .child(nav_wrapped);
 
-    // Open tasks, like Zeron's "Sessions" list.
-    let tasks: Vec<_> = enki.open_tasks().take(8).cloned().collect();
-    let current = enki.current_task.clone();
+    let add_task_btn = {
+        let model = model.clone();
+        icon_button_sized(
+            "sidebar-add-task",
+            Icon::Plus,
+            px(22.),
+            &theme,
+            window,
+            cx,
+            move |_, window, cx| {
+                model.update(cx, |m, cx| m.navigate(Page::Tasks, cx));
+                window.dispatch_action(Box::new(crate::actions::NewTask), cx);
+            },
+        )
+    };
+
+    let task_rows: Vec<AnyElement> = tasks
+        .into_iter()
+        .map(|task| {
+            let selected = current.as_deref() == Some(task.id.as_str());
+            let id = task.id.clone();
+            let row_id = SharedString::from(format!("side-task-{}", task.id));
+            let track = hover_track(row_id.clone(), theme.reduce_motion, window, cx);
+            let hover_bg = mix_hsla(theme.surface_hover, theme.accent_soft, 0.3);
+            let rest_bg = with_alpha(hover_bg, 0.0);
+            let accent = theme.accent;
+            let text = theme.text;
+            let muted = theme.text_muted;
+            let faint = theme.text_faint;
+            let title = task.title.clone();
+            let count = format!("{}/{}", task.pomodoros, task.estimate);
+
+            if selected {
+                div()
+                    .id(row_id)
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .h(px(32.))
+                    .px(px(10.))
+                    .rounded(radius::MD)
+                    .cursor_pointer()
+                    .text_size(px(13.5))
+                    .bg(theme.selected_bg)
+                    .on_click(on_model(&model, move |m, cx| {
+                        let next =
+                            (m.current_task.as_deref() != Some(id.as_str())).then(|| id.clone());
+                        m.set_current_task(next, cx);
+                    }))
+                    .child(div().size(px(6.)).rounded_full().flex_none().bg(accent))
+                    .child(div().flex_1().min_w_0().ellipsis().text_color(text).child(title))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font(crate::theme::tabular_font())
+                            .text_color(faint)
+                            .child(count),
+                    )
+                    .into_any_element()
+            } else {
+                let visual = track.animate(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .size_full()
+                        .px(px(10.))
+                        .rounded(radius::MD)
+                        .text_size(px(13.5)),
+                    180,
+                    ease_out_cubic,
+                    move |d, t| {
+                        let tc = t.clamp(0.0, 1.0);
+                        d.bg(mix_hsla(rest_bg, hover_bg, tc))
+                            .child(
+                                div()
+                                    .size(px(6.))
+                                    .rounded_full()
+                                    .flex_none()
+                                    .bg(mix_hsla(faint, accent, tc)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .ellipsis()
+                                    .text_color(mix_hsla(muted, text, tc))
+                                    .child(title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .font(crate::theme::tabular_font())
+                                    .text_color(mix_hsla(faint, muted, tc))
+                                    .child(count.clone()),
+                            )
+                    },
+                );
+                div()
+                    .id(row_id)
+                    .h(px(32.))
+                    .rounded(radius::MD)
+                    .cursor_pointer()
+                    .on_hover(track.on_hover())
+                    .on_click(on_model(&model, move |m, cx| {
+                        let next =
+                            (m.current_task.as_deref() != Some(id.as_str())).then(|| id.clone());
+                        m.set_current_task(next, cx);
+                    }))
+                    .child(visual)
+                    .into_any_element()
+            }
+        })
+        .collect();
+
     let task_section = div()
         .flex()
         .flex_col()
@@ -195,21 +426,9 @@ fn main_nav(view: &mut RootView, cx: &mut Context<RootView>) -> AnyElement {
                 .text_size(px(13.))
                 .text_color(theme.text_faint)
                 .child("Tarefas abertas")
-                .child({
-                    let model = model.clone();
-                    icon_button(
-                        "sidebar-add-task",
-                        Icon::Plus,
-                        theme,
-                        move |_, window, cx| {
-                            model.update(cx, |m, cx| m.navigate(Page::Tasks, cx));
-                            window.dispatch_action(Box::new(crate::actions::NewTask), cx);
-                        },
-                    )
-                    .size(px(22.))
-                }),
+                .child(add_task_btn),
         )
-        .when(tasks.is_empty(), |d| {
+        .when(task_rows.is_empty(), |d| {
             d.child(
                 div()
                     .px(px(10.))
@@ -219,84 +438,47 @@ fn main_nav(view: &mut RootView, cx: &mut Context<RootView>) -> AnyElement {
                     .child("Nenhuma tarefa. Adicione uma para acompanhar seus pomodoros."),
             )
         })
-        .children(tasks.into_iter().map(|task| {
-            let selected = current.as_deref() == Some(task.id.as_str());
-            let hover = theme.surface_hover;
-            let id = task.id.clone();
-            div()
-                .id(SharedString::from(format!("side-task-{}", task.id)))
-                .flex()
-                .items_center()
-                .gap(px(10.))
-                .h(px(32.))
-                .px(px(10.))
-                .rounded(radius::MD)
-                .cursor_pointer()
-                .text_size(px(13.5))
-                .when(selected, |d| d.bg(theme.selected_bg))
-                .when(!selected, |d| d.hover(move |s| s.bg(hover)))
-                .child(
-                    div()
-                        .size(px(6.))
-                        .rounded_full()
-                        .flex_none()
-                        .bg(if selected {
-                            theme.accent
-                        } else {
-                            theme.text_faint
-                        }),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .ellipsis()
-                        .text_color(if selected {
-                            theme.text
-                        } else {
-                            theme.text_muted
-                        })
-                        .child(task.title.clone()),
-                )
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .font(crate::theme::tabular_font())
-                        .text_color(theme.text_faint)
-                        .child(format!("{}/{}", task.pomodoros, task.estimate)),
-                )
-                .on_click(on_model(&model, move |m, cx| {
-                    let next = (m.current_task.as_deref() != Some(id.as_str())).then(|| id.clone());
-                    m.set_current_task(next, cx);
-                }))
-        }));
+        .children(task_rows);
 
     // The timer page shows the player itself, larger.
-    let now_playing = enki
-        .now_playing
-        .as_ref()
-        .filter(|_| enki.page != Page::Timer)
-        .map(|np| {
-            player::row(np, &model, theme, false)
-                .mx(px(10.))
-                .mb(px(8.))
-                .p(px(8.))
-                .rounded(radius::LG)
-                // Already on the sidebar's glass; glass on glass looks muddy.
-                .map(|d| {
-                    if theme.liquid() {
-                        d.bg(with_alpha(
-                            gpui::white(),
-                            if theme.is_dark { 0.07 } else { 0.5 },
-                        ))
-                    } else {
-                        d.bg(theme.surface).border_1().border_color(theme.border)
-                    }
-                })
-        });
+    let now_playing = now_playing_data.map(|np| {
+        player::row(&np, &model, &theme, false, window, cx)
+            .mx(px(10.))
+            .mb(px(8.))
+            .p(px(8.))
+            .rounded(radius::LG)
+            // Already on the sidebar's glass; glass on glass looks muddy.
+            .map(|d| {
+                if theme.liquid() {
+                    d.bg(with_alpha(
+                        gpui::white(),
+                        if theme.is_dark { 0.07 } else { 0.5 },
+                    ))
+                } else {
+                    d.bg(theme.surface).border_1().border_color(theme.border)
+                }
+            })
+    });
 
-    let today = enki.stats.today();
-    let goal = enki.settings.daily_goal.max(1);
+    let footer_mini = icon_button(
+        "footer-mini",
+        Icon::Mini,
+        &theme,
+        window,
+        cx,
+        |_, _, cx| crate::toggle_mini_window(cx),
+    );
+    let footer_settings = icon_button(
+        "footer-settings",
+        Icon::Settings,
+        &theme,
+        window,
+        cx,
+        on_model(&model, |m, cx| {
+            m.navigate(Page::Settings(SettingsSection::General), cx)
+        }),
+    );
+
     let footer = div()
         .flex()
         .flex_none()
@@ -323,17 +505,8 @@ fn main_nav(view: &mut RootView, cx: &mut Context<RootView>) -> AnyElement {
                 .text_color(theme.text)
                 .child(format!("{} de {goal} hoje", today.pomodoros)),
         )
-        .child(icon_button("footer-mini", Icon::Mini, theme, |_, _, cx| {
-            crate::toggle_mini_window(cx)
-        }))
-        .child(icon_button(
-            "footer-settings",
-            Icon::Settings,
-            theme,
-            on_model(&model, |m, cx| {
-                m.navigate(Page::Settings(SettingsSection::General), cx)
-            }),
-        ));
+        .child(footer_mini)
+        .child(footer_settings);
 
     div()
         .flex()
@@ -354,11 +527,10 @@ fn main_nav(view: &mut RootView, cx: &mut Context<RootView>) -> AnyElement {
         .into_any_element()
 }
 
-fn settings_nav(view: &mut RootView, cx: &mut Context<RootView>) -> AnyElement {
+fn settings_nav(view: &mut RootView, window: &mut Window, cx: &mut Context<RootView>) -> AnyElement {
     let model = view.model.clone();
-    let theme = Theme::get(cx);
-    let enki = model.read(cx);
-    let current = match enki.page {
+    let theme = Theme::get(cx).clone();
+    let current = match model.read(cx).page {
         Page::Settings(s) => s,
         _ => SettingsSection::General,
     };
@@ -369,35 +541,42 @@ fn settings_nav(view: &mut RootView, cx: &mut Context<RootView>) -> AnyElement {
         SettingsSection::Notifications => Icon::Bell,
         SettingsSection::Shortcuts => Icon::Keyboard,
     };
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(2.))
-        .px(px(10.))
-        .child(
-            nav_item(
-                "settings-back",
-                Icon::ArrowLeft,
-                "Voltar",
-                None,
-                false,
-                theme,
-            )
-            .mb(px(12.))
-            .on_click(on_model(&model, |m, cx| m.navigate(Page::Timer, cx))),
-        )
-        .children(SettingsSection::ALL.into_iter().map(|section| {
+    let back = div().mb(px(12.)).child(nav_item(
+        "settings-back",
+        Icon::ArrowLeft,
+        "Voltar",
+        None,
+        false,
+        &theme,
+        window,
+        cx,
+        on_model(&model, |m, cx| m.navigate(Page::Timer, cx)),
+    ));
+    let items: Vec<AnyElement> = SettingsSection::ALL
+        .into_iter()
+        .map(|section| {
             nav_item(
                 SharedString::from(format!("settings-{}", section.label())),
                 glyph(section),
                 section.label(),
                 None,
                 section == current,
-                theme,
+                &theme,
+                window,
+                cx,
+                on_model(&model, move |m, cx| {
+                    m.navigate(Page::Settings(section), cx)
+                }),
             )
-            .on_click(on_model(&model, move |m, cx| {
-                m.navigate(Page::Settings(section), cx)
-            }))
-        }))
+        })
+        .collect();
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .px(px(10.))
+        .child(back)
+        .children(items)
         .into_any_element()
 }

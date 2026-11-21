@@ -14,7 +14,10 @@ use crate::{
     media::{MediaCommand, MediaWatcher, NowPlaying},
     notify,
     settings::Settings,
-    store::{now, SessionItem, SessionRecord, Stats, Store, Task as TaskItem},
+    store::{
+        now, ListenRecord, MusicWrapped, SessionItem, SessionRecord, Stats, Store,
+        Task as TaskItem, WrappedPeriod,
+    },
     theme::Theme,
     timer::{format_clock, Finished, Phase, Timer},
     tray::{Tray, TrayAction},
@@ -26,6 +29,7 @@ pub enum Page {
     Timer,
     Tasks,
     Stats,
+    Wrapped,
     Settings(SettingsSection),
 }
 
@@ -65,6 +69,117 @@ pub const RECENT_SESSIONS_LIMIT: usize = 20;
 
 const TICK: Duration = Duration::from_millis(250);
 const MIN_INCOMPLETE_SECONDS: u64 = 60;
+const MIN_LISTEN_MS: u64 = 20_000;
+const MAX_LISTEN_DT_MS: u64 = 5_000;
+const PAUSE_FLUSH_SECS: u64 = 5 * 60;
+
+#[derive(Clone, Debug)]
+struct ActiveListen {
+    title: String,
+    artist: String,
+    player: String,
+    art_path: Option<String>,
+    started_at: i64,
+    accumulated_ms: u64,
+    focus_ms: u64,
+    last_playing_at: Option<Instant>,
+}
+
+impl ActiveListen {
+    fn matches(&self, np: &NowPlaying) -> bool {
+        self.title.eq_ignore_ascii_case(np.title.trim())
+            && self.artist.eq_ignore_ascii_case(np.artist.trim())
+    }
+
+    fn into_record(self) -> Option<ListenRecord> {
+        if self.accumulated_ms < MIN_LISTEN_MS {
+            return None;
+        }
+        let during_focus =
+            self.focus_ms >= 10_000 || self.focus_ms.saturating_mul(2) >= self.accumulated_ms;
+        Some(ListenRecord {
+            title: self.title,
+            artist: self.artist,
+            player: self.player,
+            art_path: self.art_path,
+            started_at: self.started_at,
+            seconds: (self.accumulated_ms + 500) / 1000,
+            during_focus,
+        })
+    }
+}
+
+/// Accumulates real listening time from the periodic `NowPlaying` snapshots
+/// and emits a `ListenRecord` once a track finishes, switches or times out.
+#[derive(Default)]
+struct ListenTracker {
+    active: Option<ActiveListen>,
+    last_tick: Option<Instant>,
+}
+
+impl ListenTracker {
+    fn observe(
+        &mut self,
+        now_playing: Option<&NowPlaying>,
+        in_focus: bool,
+        now: Instant,
+        wall_now: i64,
+    ) -> Option<ListenRecord> {
+        let dt_ms = self
+            .last_tick
+            .map(|prev| now.saturating_duration_since(prev).as_millis() as u64)
+            .unwrap_or(0)
+            .min(MAX_LISTEN_DT_MS);
+        self.last_tick = Some(now);
+
+        let np = match now_playing {
+            Some(np) if !np.title.trim().is_empty() => np,
+            _ => return self.flush(),
+        };
+
+        let same_track = self.active.as_ref().is_some_and(|a| a.matches(np));
+        let mut emitted = None;
+        if !same_track {
+            emitted = self.flush();
+            if np.playing {
+                self.active = Some(ActiveListen {
+                    title: np.title.trim().to_string(),
+                    artist: np.artist.trim().to_string(),
+                    player: np.player.clone(),
+                    art_path: np.art.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                    started_at: wall_now,
+                    accumulated_ms: 0,
+                    focus_ms: 0,
+                    last_playing_at: Some(now),
+                });
+            }
+            return emitted;
+        }
+
+        if let Some(active) = self.active.as_mut() {
+            if let Some(art) = &np.art {
+                active.art_path = Some(art.to_string_lossy().into_owned());
+            }
+            if np.playing {
+                active.accumulated_ms = active.accumulated_ms.saturating_add(dt_ms);
+                if in_focus {
+                    active.focus_ms = active.focus_ms.saturating_add(dt_ms);
+                }
+                active.last_playing_at = Some(now);
+            } else if active
+                .last_playing_at
+                .is_some_and(|t| now.saturating_duration_since(t).as_secs() >= PAUSE_FLUSH_SECS)
+            {
+                return self.flush();
+            }
+        }
+        emitted
+    }
+
+    fn flush(&mut self) -> Option<ListenRecord> {
+        self.active.take().and_then(ActiveListen::into_record)
+    }
+}
 
 pub struct Enki {
     pub settings: Settings,
@@ -73,6 +188,9 @@ pub struct Enki {
     pub tasks: Vec<TaskItem>,
     pub stats: Stats,
     pub recent_sessions: Vec<SessionItem>,
+    pub wrapped_period: WrappedPeriod,
+    pub wrapped_focus_only: bool,
+    pub wrapped: MusicWrapped,
     /// The local day `stats` was computed for, to refresh "today" after midnight.
     stats_day: NaiveDate,
     pub current_task: Option<String>,
@@ -86,6 +204,7 @@ pub struct Enki {
     /// Wall-clock start of the phase currently on the clock, for the history.
     phase_started_at: Option<i64>,
     media: MediaWatcher,
+    listen_tracker: ListenTracker,
     /// True when Enki paused playback entering a break, so it can resume on focus.
     media_paused_by_enki: bool,
     tray: Option<Tray>,
@@ -130,6 +249,9 @@ impl Enki {
             tasks: Vec::new(),
             stats: Stats::default(),
             recent_sessions: Vec::new(),
+            wrapped_period: WrappedPeriod::Month,
+            wrapped_focus_only: true,
+            wrapped: MusicWrapped::default(),
             stats_day: Local::now().date_naive(),
             current_task: None,
             intention: String::new(),
@@ -140,6 +262,7 @@ impl Enki {
             error,
             phase_started_at: None,
             media,
+            listen_tracker: ListenTracker::default(),
             media_paused_by_enki: false,
             tray: None,
             tray_failed: false,
@@ -195,9 +318,13 @@ impl Enki {
         if s.now_playing != before.now_playing {
             self.media.set_enabled(s.now_playing);
             if !s.now_playing {
+                self.flush_listen();
                 self.now_playing = None;
                 self.media_paused_by_enki = false;
             }
+        }
+        if !s.track_music && before.track_music {
+            self.flush_listen();
         }
         if !s.auto_pause_media {
             self.media_paused_by_enki = false;
@@ -372,6 +499,19 @@ impl Enki {
             cx.notify();
         }
 
+        if self.settings.now_playing && self.settings.track_music {
+            let in_focus = self.timer.is_running() && self.timer.phase() == Phase::Focus;
+            if let Some(listen) = self.listen_tracker.observe(
+                self.now_playing.as_ref(),
+                in_focus,
+                now,
+                crate::store::now(),
+            ) {
+                self.save_listen(listen);
+                cx.notify();
+            }
+        }
+
         for action in self.tray.as_ref().map(Tray::poll).unwrap_or_default() {
             self.handle_tray(action, cx);
         }
@@ -385,7 +525,10 @@ impl Enki {
             TrayAction::Reset => self.reset_timer(cx),
             TrayAction::Show => cx.defer(crate::show_main_window),
             TrayAction::Mini => cx.defer(crate::toggle_mini_window),
-            TrayAction::Quit => cx.quit(),
+            TrayAction::Quit => {
+                self.flush_listen();
+                cx.quit();
+            }
         }
     }
 
@@ -477,6 +620,59 @@ impl Enki {
                 Err(err) => self.error = Some(format!("Erro ao ler sessões recentes: {err:#}")),
             }
         }
+        self.reload_wrapped();
+    }
+
+    fn reload_wrapped(&mut self) {
+        if let Some(store) = &self.store {
+            match store.music_wrapped(self.wrapped_period, self.wrapped_focus_only) {
+                Ok(wrapped) => self.wrapped = wrapped,
+                Err(err) => self.error = Some(format!("Erro ao ler Wrapped de música: {err:#}")),
+            }
+        }
+    }
+
+    fn save_listen(&mut self, listen: ListenRecord) {
+        if let Some(store) = &self.store {
+            if let Err(err) = store.record_listen(&listen) {
+                self.error = Some(format!("Erro ao registrar música: {err:#}"));
+                return;
+            }
+        }
+        self.reload_wrapped();
+    }
+
+    pub fn flush_listen(&mut self) {
+        if let Some(listen) = self.listen_tracker.flush() {
+            self.save_listen(listen);
+        }
+    }
+
+    pub fn set_wrapped_period(&mut self, period: WrappedPeriod, cx: &mut Context<Self>) {
+        if self.wrapped_period != period {
+            self.wrapped_period = period;
+            self.reload_wrapped();
+            cx.notify();
+        }
+    }
+
+    pub fn set_wrapped_focus_only(&mut self, focus_only: bool, cx: &mut Context<Self>) {
+        if self.wrapped_focus_only != focus_only {
+            self.wrapped_focus_only = focus_only;
+            self.reload_wrapped();
+            cx.notify();
+        }
+    }
+
+    pub fn clear_music_history(&mut self, cx: &mut Context<Self>) {
+        self.listen_tracker.flush();
+        if let Some(store) = &self.store {
+            if let Err(err) = store.clear_listens() {
+                self.error = Some(format!("Erro ao limpar histórico de música: {err:#}"));
+            }
+        }
+        self.reload_wrapped();
+        cx.notify();
     }
 
     pub fn delete_session(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -623,6 +819,9 @@ impl Enki {
     pub fn navigate(&mut self, page: Page, cx: &mut Context<Self>) {
         if self.page != page {
             self.page = page;
+            if page == Page::Wrapped {
+                self.reload_wrapped();
+            }
             cx.notify();
         }
     }
@@ -705,14 +904,15 @@ impl Enki {
             self.settings.reduce_motion = true;
         }
         let page = std::env::var("ENKI_DEBUG_PAGE").unwrap_or_default();
-        let (page, section) = page.split_once(':').unwrap_or((page.as_str(), ""));
+        let (page, sub) = page.split_once(':').unwrap_or((page.as_str(), ""));
         let section = SettingsSection::ALL
             .into_iter()
-            .find(|s| s.label().eq_ignore_ascii_case(section))
+            .find(|s| s.label().eq_ignore_ascii_case(sub))
             .unwrap_or(SettingsSection::General);
         self.page = match page {
             "tasks" => Page::Tasks,
             "stats" => Page::Stats,
+            "wrapped" => Page::Wrapped,
             "settings" => Page::Settings(section),
             _ => Page::Timer,
         };
@@ -757,6 +957,12 @@ fn split_estimate(title: &str) -> (&str, Option<u32>) {
     }
 }
 
+impl Drop for Enki {
+    fn drop(&mut self) {
+        self.flush_listen();
+    }
+}
+
 pub fn init(cx: &mut App) -> Entity<Enki> {
     let model = cx.new(Enki::new);
     let theme = model.read(cx).build_theme();
@@ -767,7 +973,17 @@ pub fn init(cx: &mut App) -> Entity<Enki> {
 
 #[cfg(test)]
 mod tests {
-    use super::split_estimate;
+    use super::*;
+
+    fn playing(title: &str, artist: &str, is_playing: bool) -> NowPlaying {
+        NowPlaying {
+            player: "Spotify".into(),
+            title: title.into(),
+            artist: artist.into(),
+            playing: is_playing,
+            art: None,
+        }
+    }
 
     #[test]
     fn estimate_suffix() {
@@ -783,5 +999,74 @@ mod tests {
             ("Algo ~99999999999", None)
         );
         assert_eq!(split_estimate("   "), ("", None));
+    }
+
+    #[test]
+    fn listen_tracker_ignores_short_skips_and_records_full_plays() {
+        let mut tracker = ListenTracker::default();
+        let t0 = Instant::now();
+        let short = playing("Intro", "Band", true);
+        let main = playing("Time", "Hans Zimmer", true);
+
+        // 10s skip -> ignored.
+        assert!(tracker.observe(Some(&short), true, t0, 1000).is_none());
+        assert!(tracker
+            .observe(Some(&short), true, t0 + Duration::from_secs(5), 1005)
+            .is_none());
+        assert!(tracker
+            .observe(Some(&short), true, t0 + Duration::from_secs(10), 1010)
+            .is_none());
+        assert!(tracker
+            .observe(Some(&main), true, t0 + Duration::from_secs(11), 1011)
+            .is_none());
+
+        // Accumulate 25s across ticks, with a brief pause in the middle (doesn't split).
+        let mut t = t0 + Duration::from_secs(11);
+        for _ in 0..3 {
+            t += Duration::from_secs(5);
+            assert!(tracker.observe(Some(&main), true, t, 1020).is_none());
+        }
+        let paused = playing("Time", "Hans Zimmer", false);
+        t += Duration::from_secs(10);
+        assert!(tracker.observe(Some(&paused), true, t, 1030).is_none());
+        for _ in 0..2 {
+            t += Duration::from_secs(5);
+            assert!(tracker.observe(Some(&main), true, t, 1040).is_none());
+        }
+
+        // Switching to None flushes the 25s focus listen.
+        let rec = tracker
+            .observe(None, true, t + Duration::from_secs(1), 1041)
+            .expect("should emit listen");
+        assert_eq!(rec.title, "Time");
+        assert_eq!(rec.artist, "Hans Zimmer");
+        assert_eq!(rec.seconds, 25);
+        assert!(rec.during_focus);
+    }
+
+    #[test]
+    fn listen_tracker_caps_sleep_delta_and_flushes_long_pause() {
+        let mut tracker = ListenTracker::default();
+        let t0 = Instant::now();
+        let song = playing("Nuvole Bianche", "Ludovico Einaudi", true);
+        let paused = playing("Nuvole Bianche", "Ludovico Einaudi", false);
+
+        tracker.observe(Some(&song), false, t0, 2000);
+        // Simulate laptop waking up 1 hour later: capped to MAX_LISTEN_DT_MS (5s), not 3600s!
+        tracker.observe(Some(&song), false, t0 + Duration::from_secs(3600), 5600);
+        let mut t = t0 + Duration::from_secs(3600);
+        for _ in 0..4 {
+            t += Duration::from_secs(5);
+            tracker.observe(Some(&song), false, t, 5620);
+        }
+        // Pause for 5 minutes -> auto-flushes.
+        assert!(tracker
+            .observe(Some(&paused), false, t + Duration::from_secs(10), 5630)
+            .is_none());
+        let rec = tracker
+            .observe(Some(&paused), false, t + Duration::from_secs(301), 5931)
+            .expect("long pause flushes");
+        assert_eq!(rec.seconds, 25);
+        assert!(!rec.during_focus);
     }
 }

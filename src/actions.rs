@@ -16,6 +16,7 @@ actions!(
         ShowTimer,
         ShowTasks,
         ShowStats,
+        ShowWrapped,
         OpenSettings,
         ToggleSidebar,
         ToggleMini,
@@ -46,6 +47,7 @@ pub fn register(cx: &mut App) {
         KeyBinding::new("secondary-1", ShowTimer, None),
         KeyBinding::new("secondary-2", ShowTasks, None),
         KeyBinding::new("secondary-3", ShowStats, None),
+        KeyBinding::new("secondary-4", ShowWrapped, None),
         KeyBinding::new("secondary-,", OpenSettings, None),
         KeyBinding::new("secondary-b", ToggleSidebar, None),
         KeyBinding::new("secondary-shift-m", ToggleMini, None),
@@ -74,6 +76,10 @@ pub fn register(cx: &mut App) {
     cx.on_action(|_: &ShowStats, cx| {
         crate::show_main_window(cx);
         update(cx, |m, cx| m.navigate(Page::Stats, cx))
+    });
+    cx.on_action(|_: &ShowWrapped, cx| {
+        crate::show_main_window(cx);
+        update(cx, |m, cx| m.navigate(Page::Wrapped, cx))
     });
     cx.on_action(|_: &OpenSettings, cx| {
         crate::show_main_window(cx);
@@ -117,7 +123,10 @@ pub fn register(cx: &mut App) {
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
-    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(|_: &Quit, cx| {
+        update(cx, |m, _| m.flush_listen());
+        cx.quit();
+    });
 
     cx.set_menus(vec![
         Menu {
@@ -159,6 +168,7 @@ pub fn register(cx: &mut App) {
                 MenuItem::action("Timer", ShowTimer),
                 MenuItem::action("Tarefas", ShowTasks),
                 MenuItem::action("Estatísticas", ShowStats),
+                MenuItem::action("Wrapped", ShowWrapped),
                 MenuItem::separator(),
                 MenuItem::action("Mostrar/ocultar barra lateral", ToggleSidebar),
                 MenuItem::action("Modo mini", ToggleMini),

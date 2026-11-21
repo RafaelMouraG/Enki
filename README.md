@@ -12,18 +12,42 @@ Um timer pomodoro para macOS e Ubuntu, escrito em Rust com [GPUI](https://gpui.r
 
 ## O que tem
 
-- **Timer** com anel de progresso, ciclos configuráveis (foco, pausa curta, pausa longa a cada N focos) e início automático opcional de pausas e focos.
-- **Tarefas**: estimativa em pomodoros, a tarefa atual vinculada ao timer, e contagem automática quando um foco termina.
-- **Estatísticas**: foco de hoje, sequência de dias, recorde, últimos 7 dias e um heatmap dos últimos 6 meses.
+- **Timer** com anel de progresso, ciclos configuráveis (foco, pausa curta, pausa longa a cada N focos), presets rápidos, extensão de `+5 min`, intenção da sessão e início automático opcional de pausas e focos.
+- **Tarefas**: estimativa em pomodoros (inclusive com atalho `~N`), edição inline, reordenação, tarefa atual vinculada ao timer e contagem automática quando um foco termina.
+- **Estatísticas**: foco de hoje, sequência de dias, recorde, gráficos interativos (últimos 7 dias e heatmap de 6 meses), histórico de sessões recentes, registro manual e exportação em CSV.
+- **Wrapped**: retrospectiva das músicas e artistas mais ouvidos por período (7 dias, mês, ano ou tudo), com filtro para músicas ouvidas durante o foco.
 - **Barra de menus (macOS) / bandeja (Ubuntu)** com o tempo restante e atalhos para iniciar, pausar, pular e reiniciar.
 - **Modo mini**: janela pequena que flutua sobre as outras.
-- **Música tocando agora**: mostra e controla o Spotify abaixo do timer (e na barra lateral nas outras páginas), sem login e funcionando com conta grátis. No macOS usa AppleScript; no Linux, MPRIS (Spotify ou qualquer player).
+- **Música tocando agora**: mostra e controla Spotify e Apple Music (macOS) ou qualquer player MPRIS (Linux), sem login e funcionando com conta grátis, com pausa automática opcional nas pausas.
 - **Aparência**: sistema/claro/escuro, 7 cores de destaque, imagem de fundo com desfoque, e "usar cores do papel de parede" (o destaque e um leve tom das superfícies vêm da imagem).
 - **Vidro líquido**: no macOS 26 ou mais novo, a barra lateral flutuante, os cartões e os controles do timer usam o Liquid Glass do sistema (`NSGlassEffectView`), que refrata a imagem de fundo. No Ubuntu e em macOS mais antigos o vidro é desenhado pelo app: superfícies translúcidas com borda iluminada.
 - **Feedback tátil**: no trackpad Force Touch do Mac, os botões do timer, o seletor de fase e os interruptores dão um toque, e os sliders das configurações "travam" em cada posição com um clique sentido no dedo.
 - Notificações nativas e som ao fim de cada fase.
 
-## Rodando
+## Baixar
+
+Os executáveis prontos para **macOS (Apple Silicon)** e **Ubuntu / Linux (x86_64)** ficam disponíveis na aba [Releases](https://github.com/RafaelMouraG/Enki/releases/latest):
+
+### macOS
+
+1. Baixe o `.dmg` na última release e arraste o **Enki.app** para **Aplicativos**.
+2. Como o app é assinado ad-hoc (sem conta paga da Apple Developer), remova o aviso de quarentena na primeira vez:
+
+```sh
+xattr -cr /Applications/Enki.app
+```
+
+### Ubuntu / Debian
+
+Baixe o `.deb` na última release e instale com:
+
+```sh
+sudo apt install ./enki-*-linux-amd64.deb
+```
+
+Em outras distribuições Linux, baixe o `.tar.gz` com o binário pronto.
+
+## Compilando do código-fonte
 
 Requer Rust estável (`rustup`).
 
@@ -79,7 +103,7 @@ O ícone na bandeja usa o protocolo StatusNotifierItem, exibido pela extensão "
 | Iniciar / pausar | `Espaço` (ou `⌘/Ctrl + Enter`) |
 | Pular fase | `S` |
 | Reiniciar fase | `R` |
-| Timer / Tarefas / Estatísticas | `⌘/Ctrl + 1 / 2 / 3` |
+| Timer / Tarefas / Estatísticas / Wrapped | `⌘/Ctrl + 1 / 2 / 3 / 4` |
 | Nova tarefa | `⌘/Ctrl + N` |
 | Barra lateral | `⌘/Ctrl + B` |
 | Modo mini | `⌘/Ctrl + Shift + M` |

@@ -1,0 +1,185 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag da release (ex.: v0.1.0; vazio usa a versão do Cargo.toml)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: tag
+        shell: bash
+        run: |
+          CARGO_VER=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+            if [ -z "$TAG" ]; then
+              TAG="v${CARGO_VER}"
+            fi
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          DEB_VER="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${DEB_VER}" >> "$GITHUB_OUTPUT"
+
+  macos:
+    needs: meta
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Build Enki.app bundle
+        run: ./scripts/bundle-macos.sh
+
+      - name: Package DMG
+        env:
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          mkdir -p dist
+          STAGE=$(mktemp -d)
+          cp -R target/release/Enki.app "$STAGE/Enki.app"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create \
+            -volname "Enki" \
+            -srcfolder "$STAGE" \
+            -ov \
+            -format UDZO \
+            "dist/Enki-${TAG}-macos-arm64.dmg"
+          rm -rf "$STAGE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: dist/Enki-*-macos-arm64.dmg
+
+  linux:
+    needs: meta
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config clang \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libx11-xcb-dev libxcb1-dev \
+            libfontconfig-dev libfreetype-dev \
+            libvulkan-dev libzstd-dev libssl-dev libdbus-1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package .deb and .tar.gz
+        env:
+          TAG: ${{ needs.meta.outputs.tag }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          mkdir -p dist
+
+          # Debian/Ubuntu package (.deb)
+          PKG=$(mktemp -d)
+          mkdir -p \
+            "$PKG/DEBIAN" \
+            "$PKG/usr/bin" \
+            "$PKG/usr/share/applications" \
+            "$PKG/usr/share/icons/hicolor/512x512/apps"
+
+          install -m 755 target/release/enki "$PKG/usr/bin/enki"
+          install -m 644 assets/linux/enki.desktop "$PKG/usr/share/applications/enki.desktop"
+          install -m 644 assets/icon/enki-512.png "$PKG/usr/share/icons/hicolor/512x512/apps/enki.png"
+
+          cat > "$PKG/DEBIAN/control" <<EOF
+          Package: enki
+          Version: ${VERSION}
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Maintainer: RafaelMouraG
+          Depends: libc6, libfontconfig1, libfreetype6, libvulkan1, libxkbcommon0, libxkbcommon-x11-0, libxcb1, libwayland-client0, libdbus-1-3, libssl3
+          Description: Timer pomodoro escrito em Rust com GPUI
+           Timer pomodoro com tarefas, estatísticas, Wrapped de foco, modo mini e integração com players de música.
+          EOF
+
+          dpkg-deb --build --root-owner-group "$PKG" "dist/enki-${TAG}-linux-amd64.deb"
+          rm -rf "$PKG"
+
+          # Portable tarball (.tar.gz) for other Linux distributions
+          TAR_DIR=$(mktemp -d)
+          mkdir -p "$TAR_DIR/enki"
+          install -m 755 target/release/enki "$TAR_DIR/enki/enki"
+          install -m 644 assets/linux/enki.desktop "$TAR_DIR/enki/enki.desktop"
+          install -m 644 assets/icon/enki-512.png "$TAR_DIR/enki/enki.png"
+          tar -C "$TAR_DIR" -czf "dist/enki-${TAG}-linux-x86_64.tar.gz" enki
+          rm -rf "$TAR_DIR"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-amd64
+          path: |
+            dist/enki-*-linux-amd64.deb
+            dist/enki-*-linux-x86_64.tar.gz
+
+  publish:
+    needs: [meta, macos, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: Enki ${{ needs.meta.outputs.tag }}
+          generate_release_notes: true
+          files: dist/*
+          body: |
+            ### Instalação
+
+            **macOS (Apple Silicon)**
+            1. Baixe o arquivo `Enki-${{ needs.meta.outputs.tag }}-macos-arm64.dmg` e arraste o **Enki.app** para **Aplicativos**.
+            2. Como o app usa assinatura ad-hoc (sem conta Apple Developer), remova a quarentena antes de abrir pela primeira vez:
+               ```sh
+               xattr -cr /Applications/Enki.app
+               ```
+
+            **Ubuntu / Debian (x86_64)**
+            ```sh
+            sudo apt install ./enki-${{ needs.meta.outputs.tag }}-linux-amd64.deb
+            ```
+            *(Outras distros Linux: baixe o `enki-${{ needs.meta.outputs.tag }}-linux-x86_64.tar.gz`.)*

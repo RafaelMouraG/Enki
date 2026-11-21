@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "A focused pomodoro timer for macOS and Linux"
 license = "MIT"
+repository = "https://github.com/RafaelMouraG/Enki"
 
 [dependencies]
 anyhow = "1.0"

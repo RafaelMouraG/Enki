@@ -1,5 +1,6 @@
 //! Icons are compiled into the binary so the app is a single file.
-//! Most are from Lucide (ISC license), redrawn at a thinner stroke.
+//! Most are adapted from Lucide (ISC license; portions derived from Feather,
+//! MIT license), redrawn at a thinner stroke. See THIRD_PARTY_NOTICES.md.
 
 use std::borrow::Cow;
 

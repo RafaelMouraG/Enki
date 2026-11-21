@@ -1,6 +1,6 @@
 # Enki
 
-Um timer pomodoro para macOS e Ubuntu, escrito em Rust com [GPUI](https://gpui.rs) (o framework de UI do Zed). O visual segue o Zeron: tema escuro azulado, barra lateral, cartões arredondados, cor de destaque e imagem de fundo.
+Um timer pomodoro para macOS e Ubuntu, escrito em Rust com [GPUI](https://gpui.rs) (o framework de UI do Zed). O visual é inspirado no [Zeron](https://github.com/zeronsh/zeron): tema escuro azulado, barra lateral, cartões arredondados, cor de destaque e imagem de fundo.
 
 ![Timer com imagem de fundo](docs/screenshots/timer.jpg)
 
@@ -155,3 +155,11 @@ src/
   native.rs      Liquid Glass e feedback tátil (macOS)
   ui/            páginas e componentes
 ```
+
+## Créditos e licença
+
+- **Inspiração visual:** [Zeron](https://github.com/zeronsh/zeron) (apenas inspiração de design e layout; este projeto não é afiliado ao Zeron).
+- **Framework de UI:** [GPUI](https://gpui.rs) ([Zed Industries](https://github.com/zed-industries/zed), Apache-2.0) — `src/ui/text_input.rs` é adaptado do exemplo `input.rs` do GPUI.
+- **Ícones:** [Lucide](https://lucide.dev) (licença ISC; porções derivadas do [Feather](https://feathericons.com), licença MIT), redesenhados com traço mais fino.
+
+Distribuído sob a licença **MIT** — veja [LICENSE](LICENSE) e [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

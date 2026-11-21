@@ -11,6 +11,7 @@ VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/enki "$APP/Contents/MacOS/enki"
+cp LICENSE THIRD_PARTY_NOTICES.md "$APP/Contents/Resources/"
 
 ICONSET=$(mktemp -d)/Enki.iconset
 mkdir -p "$ICONSET"

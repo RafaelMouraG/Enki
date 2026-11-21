@@ -1,5 +1,10 @@
-//! Single-line text field. GPUI ships no widgets, so this follows its
-//! `input.rs` example (IME, selection, clipboard) with Enki's styling.
+//! Single-line text field. GPUI ships no widgets, so this is adapted and
+//! modified from GPUI's `examples/input.rs` (IME, selection, clipboard) with
+//! Enki's styling, word navigation, horizontal scrolling, and focus/submit
+//! behavior.
+//!
+//! Portions Copyright (c) Zed Industries, Inc.
+//! Licensed under the Apache License, Version 2.0 (see THIRD_PARTY_NOTICES.md).
 
 use std::ops::Range;
 

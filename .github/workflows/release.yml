@@ -111,11 +111,14 @@ jobs:
             "$PKG/DEBIAN" \
             "$PKG/usr/bin" \
             "$PKG/usr/share/applications" \
+            "$PKG/usr/share/doc/enki" \
             "$PKG/usr/share/icons/hicolor/512x512/apps"
 
           install -m 755 target/release/enki "$PKG/usr/bin/enki"
           install -m 644 assets/linux/enki.desktop "$PKG/usr/share/applications/enki.desktop"
           install -m 644 assets/icon/enki-512.png "$PKG/usr/share/icons/hicolor/512x512/apps/enki.png"
+          install -m 644 LICENSE "$PKG/usr/share/doc/enki/LICENSE"
+          install -m 644 THIRD_PARTY_NOTICES.md "$PKG/usr/share/doc/enki/THIRD_PARTY_NOTICES.md"
 
           cat > "$PKG/DEBIAN/control" <<EOF
           Package: enki
@@ -138,6 +141,8 @@ jobs:
           install -m 755 target/release/enki "$TAR_DIR/enki/enki"
           install -m 644 assets/linux/enki.desktop "$TAR_DIR/enki/enki.desktop"
           install -m 644 assets/icon/enki-512.png "$TAR_DIR/enki/enki.png"
+          install -m 644 LICENSE "$TAR_DIR/enki/LICENSE"
+          install -m 644 THIRD_PARTY_NOTICES.md "$TAR_DIR/enki/THIRD_PARTY_NOTICES.md"
           tar -C "$TAR_DIR" -czf "dist/enki-${TAG}-linux-x86_64.tar.gz" enki
           rm -rf "$TAR_DIR"
 

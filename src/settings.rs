@@ -1,6 +1,11 @@
 //! User preferences, persisted as JSON in the platform config directory.
 
-use std::{path::PathBuf, time::Duration};
+use std::{
+    fs::File,
+    io::Write as _,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -167,6 +172,7 @@ pub struct Settings {
     pub long_break_every: u32,
     pub auto_start_breaks: bool,
     pub auto_start_focus: bool,
+    pub auto_pause_media: bool,
     pub daily_goal: u32,
 
     // Notifications
@@ -197,6 +203,7 @@ impl Default for Settings {
             long_break_every: 4,
             auto_start_breaks: true,
             auto_start_focus: false,
+            auto_pause_media: false,
             daily_goal: 8,
             notifications: true,
             sound: Sound::Chime,
@@ -219,22 +226,119 @@ impl Settings {
     }
 
     pub fn load() -> Self {
-        std::fs::read(Self::path())
+        Self::load_from(&Self::path())
+    }
+
+    pub fn save(&self) -> anyhow::Result<()> {
+        self.save_to(&Self::path())
+    }
+
+    fn load_from(path: &Path) -> Self {
+        std::fs::read(path)
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default()
     }
 
-    pub fn save(&self) -> anyhow::Result<()> {
-        let path = Self::path();
+    fn save_to(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(path, serde_json::to_vec_pretty(self)?)?;
+        let tmp = tmp_path(path);
+        let bytes = serde_json::to_vec_pretty(self)?;
+        {
+            let mut file = File::create(&tmp)?;
+            file.write_all(&bytes)?;
+            let _ = file.sync_data();
+        }
+        if let Err(err) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err.into());
+        }
         Ok(())
     }
 
     fn path() -> PathBuf {
         crate::paths::config_dir().join("settings.json")
+    }
+}
+
+fn tmp_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| "settings.json".into());
+    name.push(".tmp");
+    path.with_file_name(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_settings_path(label: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "enki-settings-test-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = dir.join("settings.json");
+        (dir, path)
+    }
+
+    #[test]
+    fn atomic_save_and_load_roundtrip() {
+        let (dir, path) = temp_settings_path("roundtrip");
+        let custom = Settings {
+            color_scheme: ColorScheme::Dark,
+            accent: Accent::Purple,
+            match_wallpaper: false,
+            glass: Glass::Solid,
+            focus_minutes: 45,
+            short_break_minutes: 10,
+            long_break_minutes: 20,
+            long_break_every: 3,
+            auto_start_breaks: false,
+            auto_start_focus: true,
+            daily_goal: 12,
+            sound: Sound::Bell,
+            mini_on_top: false,
+            ..Settings::default()
+        };
+
+        custom.save_to(&path).expect("save settings");
+        assert!(path.exists());
+        assert!(!tmp_path(&path).exists(), "temp file should be renamed away");
+        assert_eq!(Settings::load_from(&path), custom);
+
+        // Overwrite atomically with updated values.
+        let updated = Settings {
+            focus_minutes: 50,
+            mini_on_top: true,
+            ..custom
+        };
+        updated.save_to(&path).expect("overwrite settings");
+        assert!(!tmp_path(&path).exists());
+        assert_eq!(Settings::load_from(&path), updated);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn invalid_and_missing_json_fall_back_to_default() {
+        let (dir, path) = temp_settings_path("invalid");
+        assert_eq!(Settings::load_from(&path), Settings::default());
+
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, b"{ not valid json").unwrap();
+        assert_eq!(Settings::load_from(&path), Settings::default());
+
+        // Partial JSON fills missing fields from Default.
+        std::fs::write(&path, br#"{"focus_minutes": 30, "mini_on_top": false}"#).unwrap();
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.focus_minutes, 30);
+        assert!(!loaded.mini_on_top);
+        assert_eq!(loaded.short_break_minutes, Settings::default().short_break_minutes);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

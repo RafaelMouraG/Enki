@@ -85,6 +85,8 @@ pub struct Timer {
     state: RunState,
     /// Focus sessions finished in the current set (resets after a long break).
     focus_in_set: u32,
+    /// Extra time added to the current phase via [`Timer::extend`].
+    extra: Duration,
 }
 
 impl Timer {
@@ -94,6 +96,7 @@ impl Timer {
             phase: Phase::Focus,
             state: RunState::Idle,
             focus_in_set: 0,
+            extra: Duration::ZERO,
         }
     }
 
@@ -139,7 +142,13 @@ impl Timer {
     }
 
     pub fn total(&self) -> Duration {
-        self.durations.of(self.phase)
+        self.durations.of(self.phase).saturating_add(self.extra)
+    }
+
+    /// Extends the current phase by `extra`. Cleared on reset, phase selection
+    /// or advancing to the next phase.
+    pub fn extend(&mut self, extra: Duration) {
+        self.extra = self.extra.saturating_add(extra);
     }
 
     pub fn elapsed(&self, now: Instant) -> Duration {
@@ -197,12 +206,14 @@ impl Timer {
     /// Back to the start of the current phase, stopped.
     pub fn reset(&mut self) {
         self.state = RunState::Idle;
+        self.extra = Duration::ZERO;
     }
 
     /// Jumps to `phase` without counting anything as finished.
     pub fn select_phase(&mut self, phase: Phase) {
         self.phase = phase;
         self.state = RunState::Idle;
+        self.extra = Duration::ZERO;
     }
 
     /// Ends the current phase early. Returns it when any time was spent in it.
@@ -256,6 +267,7 @@ impl Timer {
             Phase::ShortBreak => Phase::Focus,
         };
         self.state = RunState::Idle;
+        self.extra = Duration::ZERO;
     }
 }
 
@@ -349,6 +361,72 @@ mod tests {
         assert!(t.skip(t0).is_none());
         assert_eq!(t.phase(), Phase::Focus);
         assert_eq!(t.cycle_position(), 1);
+    }
+
+    #[test]
+    fn extend_while_running_adds_time_and_clears_on_advance() {
+        let t0 = Instant::now();
+        let mut t = Timer::new(quick());
+        t.start(t0);
+        t.extend(Duration::from_secs(5));
+        assert!(t.is_running());
+        assert_eq!(t.total(), Duration::from_secs(15));
+        assert_eq!(
+            t.remaining(t0 + Duration::from_secs(8)),
+            Duration::from_secs(7)
+        );
+        // Original end no longer finishes the phase.
+        assert!(t.tick(t0 + Duration::from_secs(10), |_| false).is_none());
+        assert_eq!(t.phase(), Phase::Focus);
+        // Extended end finishes the phase and clears extra on advance.
+        let f = t.tick(t0 + Duration::from_secs(15), |_| false).unwrap();
+        assert!(f.completed);
+        assert_eq!(f.elapsed, Duration::from_secs(15));
+        assert_eq!(t.phase(), Phase::ShortBreak);
+        assert_eq!(t.total(), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn extend_while_paused_adds_time() {
+        let t0 = Instant::now();
+        let mut t = Timer::new(quick());
+        t.start(t0);
+        t.pause(t0 + Duration::from_secs(4));
+        t.extend(Duration::from_secs(5));
+        t.extend(Duration::from_secs(5));
+        assert!(t.is_paused());
+        assert_eq!(t.total(), Duration::from_secs(20));
+        assert_eq!(
+            t.remaining(t0 + Duration::from_secs(100)),
+            Duration::from_secs(16)
+        );
+    }
+
+    #[test]
+    fn extend_while_idle_adds_time_and_clears_on_reset_and_select() {
+        let t0 = Instant::now();
+        let mut t = Timer::new(quick());
+        t.extend(Duration::from_secs(5));
+        assert!(t.is_idle());
+        assert_eq!(t.total(), Duration::from_secs(15));
+        assert_eq!(t.remaining(t0), Duration::from_secs(15));
+
+        t.reset();
+        assert_eq!(t.total(), Duration::from_secs(10));
+
+        t.start(t0);
+        t.extend(Duration::from_secs(5));
+        t.select_phase(Phase::Focus);
+        assert!(t.is_idle());
+        assert_eq!(t.total(), Duration::from_secs(10));
+
+        t.start(t0);
+        t.extend(Duration::from_secs(5));
+        let f = t.skip(t0 + Duration::from_secs(12)).unwrap();
+        assert!(!f.completed);
+        assert_eq!(f.elapsed, Duration::from_secs(12));
+        assert_eq!(t.phase(), Phase::ShortBreak);
+        assert_eq!(t.total(), Duration::from_secs(2));
     }
 
     #[test]

@@ -77,6 +77,10 @@ fn open_main_window(cx: &mut App) -> Option<WindowHandle<RootView>> {
     let model = state::model(cx);
     let handle = cx
         .open_window(options, |window, cx| {
+            window.on_window_should_close(cx, |window, _| {
+                native::glass_cleanup(window);
+                true
+            });
             let view = cx.new(|cx| RootView::new(model, window, cx));
             window.focus(&view.focus_handle(cx));
             view
@@ -100,30 +104,25 @@ pub fn show_main_window(cx: &mut App) {
     cx.activate(true);
 }
 
-pub fn toggle_mini_window(cx: &mut App) {
-    if let Some(handle) = cx.global_mut::<Windows>().mini.take() {
-        if handle
-            .update(cx, |_, window, _| window.remove_window())
-            .is_ok()
-        {
-            return;
-        }
-    }
+fn open_mini_window(cx: &mut App, previous_bounds: Option<WindowBounds>) {
     let on_top = state::model(cx).read(cx).settings.mini_on_top;
-    let mini_size = size(px(300.), px(84.));
-    // Top-right corner of the main display, below the menu bar.
-    let origin = cx
-        .primary_display()
-        .map(|d| {
-            let b = d.bounds();
-            point(
-                b.origin.x + b.size.width - mini_size.width - px(24.),
-                b.origin.y + px(48.),
-            )
-        })
-        .unwrap_or(point(px(80.), px(80.)));
+    let window_bounds = previous_bounds.unwrap_or_else(|| {
+        let mini_size = size(px(300.), px(84.));
+        // Top-right corner of the main display, below the menu bar.
+        let origin = cx
+            .primary_display()
+            .map(|d| {
+                let b = d.bounds();
+                point(
+                    b.origin.x + b.size.width - mini_size.width - px(24.),
+                    b.origin.y + px(48.),
+                )
+            })
+            .unwrap_or(point(px(80.), px(80.)));
+        WindowBounds::Windowed(Bounds::new(origin, mini_size))
+    });
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(Bounds::new(origin, mini_size))),
+        window_bounds: Some(window_bounds),
         titlebar: None,
         kind: if on_top {
             WindowKind::PopUp
@@ -140,9 +139,49 @@ pub fn toggle_mini_window(cx: &mut App) {
         ..Default::default()
     };
     let model = state::model(cx);
-    match cx.open_window(options, |_, cx| cx.new(|cx| MiniView::new(model, cx))) {
+    match cx.open_window(options, |window, cx| {
+        window.on_window_should_close(cx, |window, _| {
+            native::glass_cleanup(window);
+            true
+        });
+        cx.new(|cx| MiniView::new(model, cx))
+    }) {
         Ok(handle) => cx.global_mut::<Windows>().mini = Some(handle),
         Err(err) => eprintln!("enki: could not open mini window: {err:#}"),
+    }
+}
+
+pub fn toggle_mini_window(cx: &mut App) {
+    if let Some(handle) = cx.global_mut::<Windows>().mini.take() {
+        if handle
+            .update(cx, |_, window, _| {
+                native::glass_cleanup(window);
+                window.remove_window();
+            })
+            .is_ok()
+        {
+            return;
+        }
+    }
+    open_mini_window(cx, None);
+}
+
+/// Recreates the mini window if currently open so changes like `mini_on_top`
+/// (which maps to `WindowKind`) take effect immediately.
+pub fn sync_mini_window(cx: &mut App) {
+    let Some(handle) = cx.global_mut::<Windows>().mini.take() else {
+        return;
+    };
+    let mut previous_bounds = None;
+    let was_open = handle
+        .update(cx, |_, window, _| {
+            previous_bounds = Some(window.window_bounds());
+            native::glass_cleanup(window);
+            window.remove_window();
+        })
+        .is_ok();
+    if was_open {
+        open_mini_window(cx, previous_bounds);
     }
 }
 

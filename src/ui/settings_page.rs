@@ -780,7 +780,79 @@ fn timer(view: &mut RootView, window: &mut Window, cx: &mut Context<RootView>) -
         cx,
     );
     let theme = Theme::get(cx);
+    let presets = [
+        ("preset-classic", "Clássico", 25, 5, 15),
+        ("preset-deep", "Profundo", 50, 10, 20),
+        ("preset-short", "Curto", 15, 3, 10),
+    ];
+    let preset_row = div().flex().gap(px(12.)).pb(px(12.)).children(
+        presets.into_iter().map(|(id, name, f, sb, lb)| {
+            let active =
+                s.focus_minutes == f && s.short_break_minutes == sb && s.long_break_minutes == lb;
+            let model = model.clone();
+            let hover = theme.surface_hover;
+            div()
+                .id(id)
+                .flex()
+                .flex_col()
+                .flex_1()
+                .gap(px(4.))
+                .px(px(14.))
+                .py(px(12.))
+                .rounded(radius::LG)
+                .bg(if active {
+                    theme.accent_soft
+                } else {
+                    theme.surface
+                })
+                .border_1()
+                .border_color(if active { theme.accent } else { theme.border })
+                .cursor_pointer()
+                .when(!active, |d| d.hover(move |s| s.bg(hover)))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(6.))
+                        .child(
+                            div()
+                                .text_size(px(14.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(if active {
+                                    theme.accent_text
+                                } else {
+                                    theme.text
+                                })
+                                .child(name),
+                        )
+                        .when(active, |d| {
+                            d.child(icon_sized(Icon::Check, px(14.), theme.accent_text))
+                        }),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .font(crate::theme::tabular_font())
+                        .text_color(if active {
+                            theme.accent_text
+                        } else {
+                            theme.text_muted
+                        })
+                        .child(format!("{f}/{sb}/{lb} min")),
+                )
+                .on_click(move |_, _, cx| {
+                    model.update(cx, |m, cx| m.apply_preset(f, sb, lb, cx));
+                })
+        }),
+    );
+
     vec![
+        section_label(theme, "Presets").into_any_element(),
+        preset_row.into_any_element(),
+        section_label(theme, "Durações")
+            .pt(px(8.))
+            .into_any_element(),
         card("settings-card-timer", theme)
             .child(setting_row(theme, true, "Foco", None, focus))
             .child(setting_row(theme, false, "Pausa curta", None, short))
@@ -819,6 +891,18 @@ fn timer(view: &mut RootView, window: &mut Window, cx: &mut Context<RootView>) -
                     s.auto_start_focus,
                     theme,
                     set(&model, |s| s.auto_start_focus = !s.auto_start_focus),
+                ),
+            ))
+            .child(setting_row(
+                theme,
+                false,
+                "Pausar música nas pausas",
+                Some("Pausa a reprodução ao entrar na pausa e retoma no próximo foco.".into()),
+                toggle(
+                    "auto-pause-media",
+                    s.auto_pause_media,
+                    theme,
+                    set(&model, |s| s.auto_pause_media = !s.auto_pause_media),
                 ),
             ))
             .into_any_element(),

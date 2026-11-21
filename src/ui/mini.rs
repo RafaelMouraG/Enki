@@ -3,8 +3,8 @@
 use std::time::Instant;
 
 use gpui::{
-    canvas, div, prelude::*, px, Context, Entity, FontWeight, MouseButton, Subscription, Window,
-    WindowControlArea,
+    canvas, div, prelude::*, px, App, Context, Entity, FocusHandle, Focusable, FontWeight,
+    MouseButton, Subscription, Window, WindowControlArea,
 };
 
 use crate::{
@@ -23,6 +23,7 @@ use crate::{
 pub struct MiniView {
     model: Entity<Enki>,
     drag: WindowDrag,
+    focus_handle: FocusHandle,
     _subscription: Subscription,
 }
 
@@ -32,8 +33,15 @@ impl MiniView {
         Self {
             model,
             drag: WindowDrag::default(),
+            focus_handle: cx.focus_handle(),
             _subscription: subscription,
         }
+    }
+}
+
+impl Focusable for MiniView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 
@@ -87,6 +95,8 @@ impl Render for MiniView {
 
         div()
             .id("mini")
+            .key_context("Enki")
+            .track_focus(&self.focus_handle)
             .size_full()
             .flex()
             .items_center()

@@ -271,21 +271,6 @@ fn main_nav(view: &mut RootView, cx: &mut Context<RootView>) -> AnyElement {
                 }))
         }));
 
-    let error = enki.error.clone().map(|message| {
-        div()
-            .id("sidebar-error")
-            .mx(px(10.))
-            .mb(px(8.))
-            .p(px(10.))
-            .rounded(radius::MD)
-            .bg(with_alpha(theme.danger, 0.14))
-            .text_color(theme.danger)
-            .text_size(px(12.5))
-            .cursor_pointer()
-            .child(message)
-            .on_click(on_model(&model, |m, cx| m.dismiss_error(cx)))
-    });
-
     // The timer page shows the player itself, larger.
     let now_playing = enki
         .now_playing
@@ -364,7 +349,6 @@ fn main_nav(view: &mut RootView, cx: &mut Context<RootView>) -> AnyElement {
                 .overflow_y_scroll()
                 .child(task_section),
         )
-        .children(error)
         .children(now_playing)
         .child(footer)
         .into_any_element()

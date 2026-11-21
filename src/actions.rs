@@ -95,7 +95,10 @@ pub fn register(cx: &mut App) {
     cx.on_action(|_: &CloseWindow, cx| {
         if let Some(window) = cx.active_window() {
             window
-                .update(cx, |_, window, _| window.remove_window())
+                .update(cx, |_, window, _| {
+                    crate::native::glass_cleanup(window);
+                    window.remove_window();
+                })
                 .ok();
         }
     });

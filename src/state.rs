@@ -14,7 +14,7 @@ use crate::{
     media::{MediaCommand, MediaWatcher, NowPlaying},
     notify,
     settings::Settings,
-    store::{now, SessionRecord, Stats, Store, Task as TaskItem},
+    store::{now, SessionItem, SessionRecord, Stats, Store, Task as TaskItem},
     theme::Theme,
     timer::{format_clock, Finished, Phase, Timer},
     tray::{Tray, TrayAction},
@@ -60,8 +60,11 @@ impl SettingsSection {
 
 /// How many days of history the stats page shows (26 weeks).
 pub const STATS_DAYS: u32 = 7 * 26;
+/// How many recent focus sessions to show on the stats page.
+pub const RECENT_SESSIONS_LIMIT: usize = 20;
 
 const TICK: Duration = Duration::from_millis(250);
+const MIN_INCOMPLETE_SECONDS: u64 = 60;
 
 pub struct Enki {
     pub settings: Settings,
@@ -69,9 +72,12 @@ pub struct Enki {
     store: Option<Store>,
     pub tasks: Vec<TaskItem>,
     pub stats: Stats,
+    pub recent_sessions: Vec<SessionItem>,
     /// The local day `stats` was computed for, to refresh "today" after midnight.
     stats_day: NaiveDate,
     pub current_task: Option<String>,
+    /// Free-text intention for the focus session, saved with each focus record.
+    pub intention: String,
     pub page: Page,
     pub wallpaper: Option<Wallpaper>,
     pub now_playing: Option<NowPlaying>,
@@ -80,6 +86,8 @@ pub struct Enki {
     /// Wall-clock start of the phase currently on the clock, for the history.
     phase_started_at: Option<i64>,
     media: MediaWatcher,
+    /// True when Enki paused playback entering a break, so it can resume on focus.
+    media_paused_by_enki: bool,
     tray: Option<Tray>,
     /// Creating the tray failed; don't retry every tick until the setting changes.
     tray_failed: bool,
@@ -121,8 +129,10 @@ impl Enki {
             store,
             tasks: Vec::new(),
             stats: Stats::default(),
+            recent_sessions: Vec::new(),
             stats_day: Local::now().date_naive(),
             current_task: None,
+            intention: String::new(),
             page: Page::Timer,
             wallpaper: None,
             now_playing: None,
@@ -130,6 +140,7 @@ impl Enki {
             error,
             phase_started_at: None,
             media,
+            media_paused_by_enki: false,
             tray: None,
             tray_failed: false,
             _tick: tick,
@@ -185,11 +196,18 @@ impl Enki {
             self.media.set_enabled(s.now_playing);
             if !s.now_playing {
                 self.now_playing = None;
+                self.media_paused_by_enki = false;
             }
+        }
+        if !s.auto_pause_media {
+            self.media_paused_by_enki = false;
         }
         if s.menu_bar != before.menu_bar {
             self.tray_failed = false;
             self.sync_tray();
+        }
+        if s.mini_on_top != before.mini_on_top {
+            cx.defer(crate::sync_mini_window);
         }
         if s.background_image != before.background_image
             || s.background_effect != before.background_effect
@@ -198,6 +216,21 @@ impl Enki {
         }
         self.apply_theme(cx);
         cx.notify();
+    }
+
+    pub fn apply_preset(
+        &mut self,
+        focus: u32,
+        short_break: u32,
+        long_break: u32,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_settings(cx, |s| {
+            s.focus_minutes = focus;
+            s.short_break_minutes = short_break;
+            s.long_break_minutes = long_break;
+        });
+        self.sync_tray();
     }
 
     // ---- Wallpaper ---------------------------------------------------------
@@ -241,10 +274,20 @@ impl Enki {
 
     pub fn toggle_timer(&mut self, cx: &mut Context<Self>) {
         let now = Instant::now();
+        let was_running = self.timer.is_running();
         if self.timer.is_idle() {
             self.phase_started_at = Some(crate::store::now());
         }
         self.timer.toggle(now);
+        if !was_running && self.timer.is_running() && self.timer.phase() == Phase::Focus {
+            self.resume_media_for_focus(cx);
+        }
+        self.sync_tray();
+        cx.notify();
+    }
+
+    pub fn extend_timer(&mut self, extra: Duration, cx: &mut Context<Self>) {
+        self.timer.extend(extra);
         self.sync_tray();
         cx.notify();
     }
@@ -259,7 +302,9 @@ impl Enki {
     pub fn skip_phase(&mut self, cx: &mut Context<Self>) {
         let now = Instant::now();
         if let Some(finished) = self.timer.skip(now) {
-            self.record(finished);
+            if finished.completed || finished.elapsed.as_secs() >= MIN_INCOMPLETE_SECONDS {
+                self.record(finished);
+            }
         }
         self.phase_started_at = None;
         self.sync_tray();
@@ -274,11 +319,14 @@ impl Enki {
         // Switching away from a running phase keeps what was done so far.
         let elapsed = self.timer.elapsed(now);
         if !elapsed.is_zero() {
-            self.record(Finished {
+            let finished = Finished {
                 phase: self.timer.phase(),
                 elapsed,
                 completed: false,
-            });
+            };
+            if finished.completed || finished.elapsed.as_secs() >= MIN_INCOMPLETE_SECONDS {
+                self.record(finished);
+            }
         }
         self.timer.select_phase(phase);
         self.phase_started_at = None;
@@ -299,6 +347,14 @@ impl Enki {
         }) {
             self.record(finished);
             self.phase_started_at = self.timer.is_running().then(crate::store::now);
+            if finished.phase == Phase::Focus && self.timer.phase().is_break() {
+                self.pause_media_for_break(cx);
+            } else if finished.phase.is_break()
+                && self.timer.phase() == Phase::Focus
+                && self.timer.is_running()
+            {
+                self.resume_media_for_focus(cx);
+            }
             self.announce(finished);
             cx.notify();
         } else if self.timer.is_running() {
@@ -345,6 +401,10 @@ impl Enki {
             seconds: finished.elapsed.as_secs(),
             completed: finished.completed,
             task_id: self.current_task.clone(),
+            intention: (finished.phase == Phase::Focus)
+                .then(|| self.intention.trim())
+                .filter(|text| !text.is_empty())
+                .map(str::to_string),
         };
         if let Some(store) = &self.store {
             if let Err(err) = store.record_session(&record) {
@@ -412,7 +472,42 @@ impl Enki {
                 Ok(stats) => self.stats = stats,
                 Err(err) => self.error = Some(format!("Erro ao ler estatísticas: {err:#}")),
             }
+            match store.recent_sessions(RECENT_SESSIONS_LIMIT) {
+                Ok(sessions) => self.recent_sessions = sessions,
+                Err(err) => self.error = Some(format!("Erro ao ler sessões recentes: {err:#}")),
+            }
         }
+    }
+
+    pub fn delete_session(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(store) = &self.store {
+            if let Err(err) = store.delete_session(id) {
+                self.error = Some(format!("Erro ao excluir sessão: {err:#}"));
+            }
+        }
+        self.reload_tasks();
+        self.reload_stats();
+        cx.notify();
+    }
+
+    pub fn add_manual_session(&mut self, minutes: u32, cx: &mut Context<Self>) {
+        let task_id = self.current_task.clone();
+        if let Some(store) = &self.store {
+            if let Err(err) = store.add_manual_session(minutes, task_id) {
+                self.error = Some(format!("Erro ao registrar foco: {err:#}"));
+            }
+        }
+        self.reload_tasks();
+        self.reload_stats();
+        cx.notify();
+    }
+
+    pub fn export_sessions_csv(&self) -> anyhow::Result<String> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Histórico indisponível"))?;
+        store.export_sessions_csv()
     }
 
     fn with_store(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&Store) -> anyhow::Result<()>) {
@@ -425,17 +520,49 @@ impl Enki {
         cx.notify();
     }
 
+    /// Adds a task with the default estimate (or a trailing `~N` in the title).
+    #[allow(dead_code)]
     pub fn add_task(&mut self, title: &str, cx: &mut Context<Self>) {
-        if title.trim().is_empty() {
+        self.add_task_with_estimate(title, 1, cx);
+    }
+
+    /// Adds a task. A trailing `~N` in the title sets the estimate unless an
+    /// explicit `estimate` above 1 was chosen.
+    pub fn add_task_with_estimate(&mut self, title: &str, estimate: u32, cx: &mut Context<Self>) {
+        let (title, typed) = split_estimate(title);
+        if title.is_empty() {
             return;
         }
+        let estimate = if estimate > 1 {
+            estimate
+        } else {
+            typed.unwrap_or(estimate)
+        };
         let mut added = None;
         self.with_store(cx, |s| {
-            added = Some(s.add_task(title)?.id);
+            added = Some(s.add_task_with_estimate(title, estimate)?.id);
             Ok(())
         });
         if self.current_task.is_none() {
             self.current_task = added;
+        }
+    }
+
+    pub fn rename_task(&mut self, id: &str, title: &str, cx: &mut Context<Self>) {
+        if title.trim().is_empty() {
+            return;
+        }
+        self.with_store(cx, |s| s.rename_task(id, title));
+    }
+
+    pub fn move_task(&mut self, id: &str, delta: i32, cx: &mut Context<Self>) {
+        self.with_store(cx, |s| s.move_task(id, delta));
+    }
+
+    pub fn set_intention(&mut self, text: String, cx: &mut Context<Self>) {
+        if self.intention != text {
+            self.intention = text;
+            cx.notify();
         }
     }
 
@@ -457,6 +584,25 @@ impl Enki {
 
     pub fn set_current_task(&mut self, id: Option<String>, cx: &mut Context<Self>) {
         self.current_task = id;
+        cx.notify();
+    }
+
+    pub fn complete_current_task(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.current_task.clone() else {
+            return;
+        };
+        let next_task = {
+            let open: Vec<&TaskItem> = self.open_tasks().collect();
+            open.iter()
+                .skip_while(|t| t.id != id)
+                .nth(1)
+                .or_else(|| open.iter().find(|t| t.id != id))
+                .map(|t| t.id.clone())
+        };
+        self.with_store(cx, |s| s.set_task_done(&id, true));
+        self.current_task = next_task.filter(|next_id| {
+            self.tasks.iter().any(|t| &t.id == next_id && !t.done)
+        });
         cx.notify();
     }
 
@@ -487,6 +633,25 @@ impl Enki {
         if let (MediaCommand::PlayPause, Some(np)) = (cmd, self.now_playing.as_mut()) {
             np.playing = !np.playing;
             cx.notify();
+        }
+    }
+
+    fn pause_media_for_break(&mut self, cx: &mut Context<Self>) {
+        if self.settings.auto_pause_media
+            && self.now_playing.as_ref().is_some_and(|np| np.playing)
+        {
+            self.media(MediaCommand::PlayPause, cx);
+            self.media_paused_by_enki = true;
+        }
+    }
+
+    fn resume_media_for_focus(&mut self, cx: &mut Context<Self>) {
+        if !self.media_paused_by_enki {
+            return;
+        }
+        self.media_paused_by_enki = false;
+        if self.now_playing.as_ref().is_some_and(|np| !np.playing) {
+            self.media(MediaCommand::PlayPause, cx);
         }
     }
 
@@ -573,10 +738,50 @@ pub fn is_dark(appearance: WindowAppearance) -> bool {
     )
 }
 
+/// Splits a trailing `~N` estimate shortcut off a task title:
+/// `"Revisar PR ~3"` → `("Revisar PR", Some(3))`. The `~` must follow a space
+/// and leave a non-empty title, otherwise the text is kept as typed.
+fn split_estimate(title: &str) -> (&str, Option<u32>) {
+    let title = title.trim();
+    let Some((head, digits)) = title.rsplit_once('~') else {
+        return (title, None);
+    };
+    let head_trimmed = head.trim_end();
+    let valid = !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && head.ends_with(char::is_whitespace)
+        && !head_trimmed.is_empty();
+    match digits.parse::<u32>() {
+        Ok(n) if valid => (head_trimmed, Some(n)),
+        _ => (title, None),
+    }
+}
+
 pub fn init(cx: &mut App) -> Entity<Enki> {
     let model = cx.new(Enki::new);
     let theme = model.read(cx).build_theme();
     cx.set_global(theme);
     cx.set_global(AppModel(model.clone()));
     model
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_estimate;
+
+    #[test]
+    fn estimate_suffix() {
+        assert_eq!(split_estimate("Revisar PR ~3"), ("Revisar PR", Some(3)));
+        assert_eq!(split_estimate("  Tese   ~12  "), ("Tese", Some(12)));
+        assert_eq!(split_estimate("Revisar PR"), ("Revisar PR", None));
+        assert_eq!(split_estimate("v1~2"), ("v1~2", None));
+        assert_eq!(split_estimate("~3"), ("~3", None));
+        assert_eq!(split_estimate("Algo ~"), ("Algo ~", None));
+        assert_eq!(split_estimate("Algo ~3a"), ("Algo ~3a", None));
+        assert_eq!(
+            split_estimate("Algo ~99999999999"),
+            ("Algo ~99999999999", None)
+        );
+        assert_eq!(split_estimate("   "), ("", None));
+    }
 }

@@ -56,6 +56,8 @@ mod fallback {
     pub fn glass_place(_: &Window, _: SharedString, _: Bounds<Pixels>, _: &GlassStyle) {}
 
     pub fn glass_end(_: &Window) {}
+
+    pub fn glass_cleanup(_: &Window) {}
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -391,6 +393,18 @@ mod mac {
                     }
                     surface.hidden = true;
                 }
+            }
+        });
+    }
+
+    /// Tears down and removes native glass views for a closing window.
+    pub fn glass_cleanup(window: &Window) {
+        let Some(gpui) = gpui_view(window) else {
+            return;
+        };
+        HOSTS.with_borrow_mut(|hosts| {
+            if let Some(host) = hosts.remove(&(gpui as usize)) {
+                unsafe { teardown(host) };
             }
         });
     }

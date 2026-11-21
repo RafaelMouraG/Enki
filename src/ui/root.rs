@@ -15,7 +15,7 @@ use crate::{
     timer::Phase,
     ui::{
         components::StyledExt as _,
-        components::{icon, icon_button, WindowDrag},
+        components::{icon, icon_button, icon_sized, WindowDrag},
         on_model, settings_page, sidebar, stats_page, tasks_page,
         text_input::{TextInput, TextInputEvent},
         timer_page,
@@ -29,6 +29,10 @@ pub const TRAFFIC_LIGHTS_WIDTH: f32 = 84.;
 pub struct RootView {
     pub model: Entity<Enki>,
     pub task_input: Entity<TextInput>,
+    pub new_task_estimate: u32,
+    pub editing_task: Option<String>,
+    pub edit_task_input: Entity<TextInput>,
+    pub intention_input: Entity<TextInput>,
     /// Which dropdown in the settings page is open.
     pub open_menu: Option<SharedString>,
     pub drag: WindowDrag,
@@ -39,6 +43,8 @@ pub struct RootView {
 impl RootView {
     pub fn new(model: Entity<Enki>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let task_input = cx.new(|cx| TextInput::new("Adicionar tarefa…", cx));
+        let edit_task_input = cx.new(|cx| TextInput::new("Título da tarefa…", cx));
+        let intention_input = cx.new(|cx| TextInput::new("No que você vai focar?", cx));
 
         let subscriptions = vec![
             cx.observe(&model, |_, _, cx| cx.notify()),
@@ -50,15 +56,47 @@ impl RootView {
             cx.subscribe(&task_input, |this, input, event, cx| {
                 if let TextInputEvent::Submit = event {
                     let text = input.read(cx).text().to_string();
-                    this.model.update(cx, |m, cx| m.add_task(&text, cx));
+                    let estimate = this.new_task_estimate;
+                    this.model
+                        .update(cx, |m, cx| m.add_task_with_estimate(&text, estimate, cx));
                     input.update(cx, |input, cx| input.clear(cx));
+                    if !text.trim().is_empty() {
+                        this.new_task_estimate = 1;
+                        cx.notify();
+                    }
                 }
+            }),
+            cx.subscribe(&edit_task_input, |this, input, event, cx| match event {
+                TextInputEvent::Submit => {
+                    if let Some(id) = this.editing_task.take() {
+                        let title = input.read(cx).text().to_string();
+                        this.model.update(cx, |m, cx| m.rename_task(&id, &title, cx));
+                        cx.notify();
+                    }
+                }
+                TextInputEvent::Cancel => {
+                    if this.editing_task.take().is_some() {
+                        cx.notify();
+                    }
+                }
+                TextInputEvent::Changed => {}
+            }),
+            cx.subscribe(&intention_input, |this, input, event, cx| match event {
+                TextInputEvent::Changed | TextInputEvent::Submit => {
+                    let text = input.read(cx).text().to_string();
+                    this.model.update(cx, |m, cx| m.set_intention(text, cx));
+                }
+                TextInputEvent::Cancel => {}
             }),
         ];
 
         Self {
             model,
             task_input,
+            new_task_estimate: 1,
+            editing_task: None,
+            edit_task_input,
+            intention_input,
             // Dev helper for screenshots of an open dropdown.
             open_menu: cfg!(debug_assertions)
                 .then(|| std::env::var("ENKI_DEBUG_MENU").ok())
@@ -72,6 +110,21 @@ impl RootView {
 
     pub fn focus_task_input(&self, window: &mut Window, cx: &mut App) {
         window.focus(&self.task_input.focus_handle(cx));
+    }
+
+    pub fn start_editing_task(
+        &mut self,
+        id: String,
+        title: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editing_task = Some(id);
+        let title = title.to_string();
+        self.edit_task_input
+            .update(cx, |input, cx| input.set_text(title, cx));
+        window.focus(&self.edit_task_input.focus_handle(cx));
+        cx.notify();
     }
 
     fn titlebar(
@@ -226,6 +279,49 @@ impl RootView {
         )
     }
 
+    /// Floating error toast, visible even when the sidebar is collapsed.
+    fn error_toast(&self, cx: &App) -> Option<AnyElement> {
+        let message = self.model.read(cx).error.clone()?;
+        let theme = Theme::get(cx);
+        let model = self.model.clone();
+        Some(
+            div()
+                .id("error-toast")
+                .absolute()
+                .bottom(px(16.))
+                .right(px(16.))
+                .max_w(px(420.))
+                .rounded(radius::LG)
+                .bg(theme.surface)
+                .border_1()
+                .border_color(with_alpha(theme.danger, 0.45))
+                .shadow(theme.popover_shadow())
+                .overflow_hidden()
+                .cursor_pointer()
+                .occlude()
+                .on_click(on_model(&model, |m, cx| m.dismiss_error(cx)))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .px(px(14.))
+                        .py(px(10.))
+                        .bg(with_alpha(theme.danger, 0.12))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(px(13.))
+                                .text_color(theme.danger)
+                                .child(message),
+                        )
+                        .child(icon_sized(Icon::X, px(14.), theme.danger)),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// Starts the native glass frame: backdrop under everything, or nothing.
     fn begin_glass(&self, window: &Window, cx: &App) {
         let theme = Theme::get(cx);
@@ -267,7 +363,10 @@ fn window_controls(theme: &Theme) -> impl IntoElement {
                     .group_hover("window-control", move |s| s.text_color(text)),
             )
             .on_click(move |_, window, _| match area {
-                WindowControlArea::Close => window.remove_window(),
+                WindowControlArea::Close => {
+                    native::glass_cleanup(window);
+                    window.remove_window();
+                }
                 WindowControlArea::Max => window.zoom_window(),
                 WindowControlArea::Min => window.minimize_window(),
                 WindowControlArea::Drag => {}
@@ -399,10 +498,11 @@ impl Render for RootView {
         let body: AnyElement = match page {
             Page::Timer => timer_page::render(self, window, cx),
             Page::Tasks => tasks_page::render(self, window, cx),
-            Page::Stats => stats_page::render(self, cx),
+            Page::Stats => stats_page::render(self, window, cx),
             Page::Settings(section) => settings_page::render(self, section, window, cx),
         };
         let sidebar = sidebar_open.then(|| sidebar::render(self, window, cx));
+        let error_toast = self.error_toast(cx);
         // Drawn edges only while floating; maximized or tiled, the window meets the screen edge.
         let floating = matches!(
             window.window_decorations(),
@@ -451,6 +551,7 @@ impl Render for RootView {
                     .child(titlebar)
                     .child(div().flex().flex_col().flex_1().min_h_0().child(body)),
             )
+            .children(error_toast)
             .when(floating, |d| d.child(resize_handles()))
             // Painted last: hides glass views nothing placed this frame.
             .child(

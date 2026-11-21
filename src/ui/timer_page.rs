@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, ease_in_out, prelude::*, px, Animation, AnimationExt as _, AnyElement, Context,
+    div, ease_in_out, prelude::*, px, Animation, AnimationExt as _, AnyElement, Context, Focusable,
     FontWeight, MouseButton, SharedString, Window,
 };
 
@@ -24,7 +24,8 @@ use crate::{
 const RING: f32 = 300.;
 const PLAYER_RADIUS: gpui::Pixels = px(18.);
 
-pub fn render(view: &mut RootView, _window: &mut Window, cx: &mut Context<RootView>) -> AnyElement {
+pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootView>) -> AnyElement {
+    let intention_focused = view.intention_input.focus_handle(cx).is_focused(window);
     let model = view.model.clone();
     let theme = Theme::get(cx);
     let enki = model.read(cx);
@@ -183,14 +184,132 @@ pub fn render(view: &mut RootView, _window: &mut Window, cx: &mut Context<RootVi
                 .on_click(on_model(&model, |m, cx| m.skip_phase(cx))),
         );
 
-    // The current task and, when something is playing, the player.
+    let extend_button = (!timer.is_idle()).then(|| {
+        let hover = theme.surface_hover;
+        let text_color = theme.text;
+        div()
+            .id("timer-extend")
+            .relative()
+            .flex()
+            .items_center()
+            .justify_center()
+            .h(px(28.))
+            .px(px(12.))
+            .rounded_full()
+            .text_size(px(12.5))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme.text_muted)
+            .map(|d| {
+                if liquid {
+                    d.child(glass_styled("timer-extend", px(14.), true, theme))
+                        .hover(move |s| s.bg(with_alpha(gpui::white(), 0.08)).text_color(text_color))
+                } else {
+                    d.bg(with_alpha(theme.surface, 0.8))
+                        .border_1()
+                        .border_color(theme.border)
+                        .hover(move |s| s.bg(hover).text_color(text_color))
+                }
+            })
+            .cursor_pointer()
+            .active(|s| s.opacity(0.85))
+            .on_mouse_down(MouseButton::Left, |_, _, _| native::haptic(Haptic::Generic))
+            .on_click(on_model(&model, |m, cx| {
+                m.extend_timer(Duration::from_secs(5 * 60), cx)
+            }))
+            .child("+5 min")
+    });
+
+    let controls_block = div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(12.))
+        .child(controls)
+        .child(
+            div()
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .children(extend_button),
+        );
+
+    // The current task (or a quick focus intention) and, when something is playing, the player.
     let current_task = enki.current_task_title().map(|t| t.to_string());
+    let has_intention = !enki.intention.trim().is_empty();
+    let intention_chip = (current_task.is_none() && phase == Phase::Focus).then(|| {
+        let input = view.intention_input.clone();
+        let clear_input = input.clone();
+        let clear_model = model.clone();
+        div().flex().justify_center().child(
+            div()
+                .id("session-intention")
+                .relative()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .w(px(320.))
+                .h(px(34.))
+                .px(px(12.))
+                .rounded_full()
+                .map(|d| {
+                    if liquid {
+                        d.child(glass_styled("session-intention", px(17.), true, theme))
+                    } else {
+                        d.bg(if has_wallpaper {
+                            with_alpha(theme.surface, 0.8)
+                        } else {
+                            theme.surface
+                        })
+                    }
+                })
+                .border_1()
+                .border_color(if intention_focused {
+                    theme.accent
+                } else if liquid {
+                    gpui::transparent_black()
+                } else {
+                    theme.border
+                })
+                .text_size(px(13.))
+                .text_color(theme.text)
+                .child(
+                    icon(Icon::Target)
+                        .size(px(13.))
+                        .text_color(if intention_focused || has_intention {
+                            theme.accent_text
+                        } else {
+                            theme.text_faint
+                        }),
+                )
+                .child(input)
+                .when(has_intention, |d| {
+                    d.child(
+                        div()
+                            .id("clear-intention")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(18.))
+                            .rounded_full()
+                            .cursor_pointer()
+                            .hover(|s| s.opacity(0.7))
+                            .child(icon(Icon::X).size(px(12.)).text_color(theme.text_muted))
+                            .on_click(move |_, _, cx| {
+                                clear_input.update(cx, |i, cx| i.clear(cx));
+                                clear_model.update(cx, |m, cx| m.set_intention(String::new(), cx));
+                            }),
+                    )
+                }),
+        )
+    });
     let below = div()
         .flex()
         .flex_col()
         .w_full()
         .max_w(px(560.))
         .gap(px(8.))
+        .children(intention_chip)
         .when_some(current_task, |d, title| {
             d.child(
                 div().flex().justify_center().child(
@@ -213,6 +332,26 @@ pub fn render(view: &mut RootView, _window: &mut Window, cx: &mut Context<RootVi
                                 .text_color(theme.accent_text),
                         )
                         .child(div().max_w(px(360.)).ellipsis().child(title))
+                        .child(
+                            div()
+                                .id("complete-current-task")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size(px(18.))
+                                .rounded_full()
+                                .cursor_pointer()
+                                .hover(|s| s.opacity(0.7))
+                                .on_mouse_down(MouseButton::Left, |_, _, _| {
+                                    native::haptic(Haptic::Generic)
+                                })
+                                .child(
+                                    icon(Icon::Check)
+                                        .size(px(12.))
+                                        .text_color(theme.accent_text),
+                                )
+                                .on_click(on_model(&model, |m, cx| m.complete_current_task(cx))),
+                        )
                         .child(
                             div()
                                 .id("clear-current-task")
@@ -334,8 +473,7 @@ pub fn render(view: &mut RootView, _window: &mut Window, cx: &mut Context<RootVi
                 .py(px(12.))
                 .child(segmented("phase", theme, phases))
                 .child(ring_block)
-                .child(controls)
-                .child(div().h(px(8.)))
+                .child(controls_block)
                 .child(below),
         )
         .child(status_bar)

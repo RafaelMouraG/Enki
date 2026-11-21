@@ -5,6 +5,7 @@ use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
 use anyhow::{Context as _, Result};
@@ -23,6 +24,43 @@ pub struct Wallpaper {
 const MAX_EDGE: u32 = 2400;
 /// Bump when processing changes so cached results are recomputed.
 const CACHE_VERSION: u32 = 2;
+const MAX_CACHED_WALLPAPERS: usize = 20;
+
+fn touch_modified(path: &Path) {
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|f| f.set_modified(SystemTime::now()));
+}
+
+fn prune_wallpaper_cache(dir: &Path, max_wallpapers: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut wallpapers: Vec<(SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jpg") {
+                return None;
+            }
+            let meta = entry.metadata().ok()?;
+            meta.is_file().then(|| {
+                let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                (mtime, path)
+            })
+        })
+        .collect();
+    if wallpapers.len() <= max_wallpapers {
+        return;
+    }
+    wallpapers.sort_by_key(|a| std::cmp::Reverse(a.0));
+    for (_, jpg) in wallpapers.into_iter().skip(max_wallpapers) {
+        let tint = jpg.with_extension("tint");
+        let _ = std::fs::remove_file(&jpg);
+        let _ = std::fs::remove_file(&tint);
+    }
+}
 
 pub fn process(source: &Path, effect: BackgroundEffect) -> Result<Wallpaper> {
     let meta = std::fs::metadata(source).with_context(|| format!("reading {source:?}"))?;
@@ -40,6 +78,7 @@ pub fn process(source: &Path, effect: BackgroundEffect) -> Result<Wallpaper> {
     let tint_file = cache.join(format!("{key:016x}.tint"));
 
     if let (true, Some(tint)) = (rendered.exists(), read_tint(&tint_file)) {
+        touch_modified(&rendered);
         return Ok(Wallpaper { rendered, tint });
     }
 
@@ -69,6 +108,7 @@ pub fn process(source: &Path, effect: BackgroundEffect) -> Result<Wallpaper> {
         .save_with_format(&rendered, image::ImageFormat::Jpeg)
         .context("saving processed wallpaper")?;
     let _ = std::fs::write(&tint_file, format!("{} {} {}", tint.r, tint.g, tint.b));
+    prune_wallpaper_cache(&cache, MAX_CACHED_WALLPAPERS);
 
     Ok(Wallpaper { rendered, tint })
 }
@@ -212,5 +252,37 @@ mod tests {
         let img = RgbImage::from_pixel(10, 10, Rgb([120, 120, 120]));
         let c = dominant_color(&DynamicImage::ImageRgb8(img));
         assert!((c.r - c.b).abs() < 0.01);
+    }
+
+    #[test]
+    fn prune_wallpaper_cache_keeps_newest_pairs() {
+        use std::time::Duration;
+
+        let dir =
+            std::env::temp_dir().join(format!("enki-wallpaper-cache-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+        for i in 0..4u64 {
+            let jpg = dir.join(format!("wall-{i}.jpg"));
+            let tint = dir.join(format!("wall-{i}.tint"));
+            std::fs::write(&jpg, b"jpg").unwrap();
+            std::fs::write(&tint, b"0.1 0.2 0.3").unwrap();
+            let f = std::fs::OpenOptions::new().write(true).open(&jpg).unwrap();
+            f.set_modified(now - Duration::from_secs((4 - i) * 60))
+                .unwrap();
+        }
+
+        prune_wallpaper_cache(&dir, 2);
+
+        for i in 0..2 {
+            assert!(!dir.join(format!("wall-{i}.jpg")).exists());
+            assert!(!dir.join(format!("wall-{i}.tint")).exists());
+        }
+        for i in 2..4 {
+            assert!(dir.join(format!("wall-{i}.jpg")).exists());
+            assert!(dir.join(format!("wall-{i}.tint")).exists());
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -161,7 +161,9 @@ impl Render for MiniView {
                 if theme.native_glass {
                     d.child(glass("mini", radius::LG, &theme))
                 } else {
-                    d.bg(theme.window_bg)
+                    d.bg(theme.window_bg).when(client_decorated, |d| {
+                        d.border_1().border_color(theme.border_strong)
+                    })
                 }
             })
             .rounded(radius::LG)

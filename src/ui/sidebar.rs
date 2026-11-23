@@ -1,7 +1,7 @@
 //! Left column: navigation, task list, now playing and the footer.
 
 use gpui::{
-    div, prelude::*, px, AnyElement, App, ClickEvent, Context, Decorations, FontWeight,
+    div, prelude::*, px, AnyElement, App, ClickEvent, Context, Decorations, FontWeight, Pixels,
     SharedString, Window,
 };
 
@@ -22,7 +22,13 @@ use crate::{
 const FLOAT_INSET: f32 = 8.;
 const FLOAT_RADIUS: gpui::Pixels = px(18.);
 
-pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootView>) -> AnyElement {
+pub fn render(
+    view: &mut RootView,
+    tl_radius: Pixels,
+    bl_radius: Pixels,
+    window: &mut Window,
+    cx: &mut Context<RootView>,
+) -> AnyElement {
     let model = view.model.clone();
     let theme = Theme::get(cx).clone();
     let in_settings = matches!(model.read(cx).page, Page::Settings(_));
@@ -77,7 +83,11 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
                     .m(px(inset))
                     .child(glass("sidebar", FLOAT_RADIUS, &theme))
             } else {
-                d.w(sidebar_width()).h_full().bg(theme.sidebar_bg)
+                d.w(sidebar_width())
+                    .h_full()
+                    .bg(theme.sidebar_bg)
+                    .rounded_tl(tl_radius)
+                    .rounded_bl(bl_radius)
             }
         })
         .child(header)

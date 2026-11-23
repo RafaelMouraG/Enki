@@ -1,10 +1,14 @@
 //! The main window: title bar, sidebar and the current page.
 
+use std::{path::PathBuf, sync::Arc, time::Instant};
+
 use gpui::{
-    canvas, div, img, linear_color_stop, linear_gradient, prelude::*, px, AnyElement, App, Context,
-    Decorations, Entity, FocusHandle, Focusable, ImageSource, MouseButton, ObjectFit, ResizeEdge,
-    SharedString, Subscription, Window, WindowControlArea,
+    canvas, div, img, linear_color_stop, linear_gradient, point, prelude::*, px, AnyElement, App,
+    BoxShadow, Context, Decorations, Entity, FocusHandle, Focusable, ImageId, ImageSource,
+    MouseButton, ObjectFit, Pixels, RenderImage, ResizeEdge, SharedString, Subscription, Tiling,
+    Window, WindowControlArea,
 };
+use image::{Frame, RgbaImage};
 
 use crate::{
     actions,
@@ -26,6 +30,240 @@ use crate::{
 pub const TITLEBAR_HEIGHT: f32 = 52.;
 /// Room left for the macOS traffic lights.
 pub const TRAFFIC_LIGHTS_WIDTH: f32 = 84.;
+/// Corner radius of floating client-decorated windows (Linux Wayland/X11).
+const WINDOW_RADIUS: Pixels = px(12.);
+/// Transparent outer margin for the drop shadow and resize grips on Linux CSD.
+const WINDOW_SHADOW_INSET: Pixels = px(12.);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct WindowCorners {
+    tl: Pixels,
+    tr: Pixels,
+    br: Pixels,
+    bl: Pixels,
+}
+
+impl WindowCorners {
+    fn from_tiling(tiling: Tiling) -> Self {
+        Self {
+            tl: if !(tiling.top || tiling.left) {
+                WINDOW_RADIUS
+            } else {
+                px(0.)
+            },
+            tr: if !(tiling.top || tiling.right) {
+                WINDOW_RADIUS
+            } else {
+                px(0.)
+            },
+            br: if !(tiling.bottom || tiling.right) {
+                WINDOW_RADIUS
+            } else {
+                px(0.)
+            },
+            bl: if !(tiling.bottom || tiling.left) {
+                WINDOW_RADIUS
+            } else {
+                px(0.)
+            },
+        }
+    }
+
+    fn any(self) -> bool {
+        self.tl > px(0.) || self.tr > px(0.) || self.br > px(0.) || self.bl > px(0.)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RoundedSourceKey {
+    Static(PathBuf),
+    Animated(ImageId),
+    Video(ImageId),
+}
+
+/// Keeps an aspect-matched center-cropped `RenderImage` so GPUI's shader can
+/// apply SDF `corner_radii` directly at the window corners on Linux CSD.
+#[derive(Default)]
+struct RoundedWallpaperCache {
+    source_key: Option<RoundedSourceKey>,
+    static_bgra: Option<(u32, u32, Vec<u8>)>,
+    aspect_bucket: u32,
+    last_anim_crop: Option<Instant>,
+    cropped: Option<Arc<RenderImage>>,
+}
+
+impl RoundedWallpaperCache {
+    fn clear(&mut self, cx: &mut App) {
+        self.source_key = None;
+        self.static_bgra = None;
+        self.aspect_bucket = 0;
+        self.last_anim_crop = None;
+        if let Some(old) = self.cropped.take() {
+            cx.drop_image(old, None);
+        }
+    }
+
+    fn replace_cropped(&mut self, next: Option<Arc<RenderImage>>, cx: &mut App) {
+        if let Some(old) = std::mem::replace(&mut self.cropped, next) {
+            cx.drop_image(old, None);
+        }
+    }
+
+    fn get_or_update(
+        &mut self,
+        wallpaper: &crate::wallpaper::Wallpaper,
+        video_frame: Option<&Arc<RenderImage>>,
+        dst_w: f32,
+        dst_h: f32,
+        cx: &mut App,
+    ) -> Option<Arc<RenderImage>> {
+        if dst_w <= 0.0 || dst_h <= 0.0 {
+            return None;
+        }
+        let bucket = ((dst_w / dst_h) * 200.0).round() as u32;
+
+        match &wallpaper.content {
+            WallpaperContent::Static => {
+                self.update_static(&wallpaper.preview, dst_w, dst_h, bucket, cx)
+            }
+            WallpaperContent::Animated(render_img) => {
+                let key = RoundedSourceKey::Animated(render_img.id);
+                let source_changed = self.source_key.as_ref() != Some(&key);
+                let aspect_changed = self.aspect_bucket != bucket;
+                let debounce_ok = self
+                    .last_anim_crop
+                    .is_none_or(|t| t.elapsed().as_millis() >= 150);
+
+                if source_changed || (aspect_changed && debounce_ok) || self.cropped.is_none() {
+                    let cropped = crop_render_image_to_aspect(render_img, dst_w, dst_h);
+                    self.static_bgra = None;
+                    self.source_key = Some(key);
+                    self.aspect_bucket = bucket;
+                    self.last_anim_crop = Some(Instant::now());
+                    self.replace_cropped(cropped, cx);
+                }
+                self.cropped.clone()
+            }
+            WallpaperContent::Video { .. } => {
+                if let Some(frame) = video_frame {
+                    let key = RoundedSourceKey::Video(frame.id);
+                    if self.source_key.as_ref() != Some(&key)
+                        || self.aspect_bucket != bucket
+                        || self.cropped.is_none()
+                    {
+                        let cropped = crop_render_image_to_aspect(frame, dst_w, dst_h);
+                        self.static_bgra = None;
+                        self.source_key = Some(key);
+                        self.aspect_bucket = bucket;
+                        self.replace_cropped(cropped, cx);
+                    }
+                    self.cropped.clone()
+                } else {
+                    self.update_static(&wallpaper.preview, dst_w, dst_h, bucket, cx)
+                }
+            }
+        }
+    }
+
+    fn update_static(
+        &mut self,
+        preview: &PathBuf,
+        dst_w: f32,
+        dst_h: f32,
+        bucket: u32,
+        cx: &mut App,
+    ) -> Option<Arc<RenderImage>> {
+        let key = RoundedSourceKey::Static(preview.clone());
+        let source_changed = self.source_key.as_ref() != Some(&key);
+        if source_changed || self.static_bgra.is_none() {
+            let mut rgba = image::open(preview).ok()?.into_rgba8();
+            let (w, h) = rgba.dimensions();
+            for px in rgba.as_chunks_mut::<4>().0 {
+                px.swap(0, 2);
+            }
+            self.static_bgra = Some((w, h, rgba.into_raw()));
+            self.source_key = Some(key);
+            self.aspect_bucket = 0;
+        }
+        if self.aspect_bucket != bucket || self.cropped.is_none() {
+            let (w, h, bytes) = self.static_bgra.as_ref()?;
+            let cropped = crop_bgra_frame(bytes, *w, *h, dst_w, dst_h)
+                .map(|img| Arc::new(RenderImage::new(vec![Frame::new(img)])));
+            self.aspect_bucket = bucket;
+            self.replace_cropped(cropped, cx);
+        }
+        self.cropped.clone()
+    }
+}
+
+/// Computes a centered crop rectangle `(x, y, crop_w, crop_h)` inside
+/// `(src_w, src_h)` matching `dst_w / dst_h`.
+fn crop_rect_for_aspect(src_w: u32, src_h: u32, dst_w: f32, dst_h: f32) -> (u32, u32, u32, u32) {
+    if src_w == 0 || src_h == 0 || dst_w <= 0.0 || dst_h <= 0.0 {
+        return (0, 0, src_w, src_h);
+    }
+    let src_aspect = src_w as f32 / src_h as f32;
+    let dst_aspect = dst_w / dst_h;
+    if (src_aspect - dst_aspect).abs() / src_aspect.max(dst_aspect) < 0.005 {
+        return (0, 0, src_w, src_h);
+    }
+    if src_aspect > dst_aspect {
+        let crop_w = ((src_h as f32 * dst_aspect).round() as u32).clamp(1, src_w);
+        ((src_w - crop_w) / 2, 0, crop_w, src_h)
+    } else {
+        let crop_h = ((src_w as f32 / dst_aspect).round() as u32).clamp(1, src_h);
+        (0, (src_h - crop_h) / 2, src_w, crop_h)
+    }
+}
+
+fn crop_bgra_frame(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst_w: f32,
+    dst_h: f32,
+) -> Option<RgbaImage> {
+    let (cx, cy, cw, ch) = crop_rect_for_aspect(src_w, src_h, dst_w, dst_h);
+    if cw == 0 || ch == 0 {
+        return None;
+    }
+    let src_stride = (src_w as usize) * 4;
+    let dst_stride = (cw as usize) * 4;
+    if src.len() < src_stride * (src_h as usize) {
+        return None;
+    }
+    if cx == 0 && cy == 0 && cw == src_w && ch == src_h {
+        return RgbaImage::from_raw(cw, ch, src[..src_stride * (src_h as usize)].to_vec());
+    }
+    let mut out = vec![0u8; dst_stride * (ch as usize)];
+    let x_off = (cx as usize) * 4;
+    for row in 0..(ch as usize) {
+        let src_start = ((cy as usize) + row) * src_stride + x_off;
+        let dst_start = row * dst_stride;
+        out[dst_start..dst_start + dst_stride]
+            .copy_from_slice(&src[src_start..src_start + dst_stride]);
+    }
+    RgbaImage::from_raw(cw, ch, out)
+}
+
+fn crop_render_image_to_aspect(
+    src: &RenderImage,
+    dst_w: f32,
+    dst_h: f32,
+) -> Option<Arc<RenderImage>> {
+    let count = src.frame_count();
+    if count == 0 {
+        return None;
+    }
+    let mut frames = Vec::with_capacity(count);
+    for i in 0..count {
+        let bytes = src.as_bytes(i)?;
+        let sz = src.size(i);
+        let cropped = crop_bgra_frame(bytes, sz.width.0 as u32, sz.height.0 as u32, dst_w, dst_h)?;
+        frames.push(Frame::from_parts(cropped, 0, 0, src.delay(i)));
+    }
+    Some(Arc::new(RenderImage::new(frames)))
+}
 
 pub struct RootView {
     pub model: Entity<Enki>,
@@ -37,6 +275,7 @@ pub struct RootView {
     /// Which dropdown in the settings page is open.
     pub open_menu: Option<SharedString>,
     pub drag: WindowDrag,
+    rounded_wallpaper: RoundedWallpaperCache,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -104,6 +343,7 @@ impl RootView {
                 .flatten()
                 .map(SharedString::from),
             drag: WindowDrag::default(),
+            rounded_wallpaper: RoundedWallpaperCache::default(),
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
         }
@@ -231,50 +471,114 @@ impl RootView {
     /// The wallpaper drawn by GPUI. When a native backdrop is active (macOS
     /// Liquid Glass or native video player), the backdrop sits under GPUI
     /// instead, so this draws nothing.
-    fn background(&self, cx: &App) -> Option<AnyElement> {
-        let theme = Theme::get(cx);
-        let enki = self.model.read(cx);
-        let wallpaper = enki.wallpaper.as_ref().filter(|_| !theme.native_backdrop)?;
-        let dim = enki.settings.background_dim as f32 / 100.0;
-        let media: AnyElement = match &wallpaper.content {
-            WallpaperContent::Static => img(ImageSource::from(wallpaper.preview.clone()))
-                .size_full()
-                .object_fit(ObjectFit::Cover)
-                .into_any_element(),
-            WallpaperContent::Animated(render_img) => {
-                img(ImageSource::Render(render_img.clone()))
-                    .id(("wallpaper-anim", render_img.id.0))
+    fn background(
+        &mut self,
+        corners: WindowCorners,
+        inner_size: (f32, f32),
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let theme = Theme::get(cx).clone();
+        if theme.native_backdrop || self.model.read(cx).wallpaper.is_none() {
+            self.rounded_wallpaper.clear(cx);
+            return None;
+        }
+
+        let dim = self.model.read(cx).settings.background_dim as f32 / 100.0;
+
+        let media: AnyElement = if corners.any() {
+            let (wallpaper, video_frame) = {
+                let enki = self.model.read(cx);
+                (enki.wallpaper.clone()?, enki.video_frame.clone())
+            };
+            let cropped = {
+                let mut cache = std::mem::take(&mut self.rounded_wallpaper);
+                let res = cache.get_or_update(
+                    &wallpaper,
+                    video_frame.as_ref(),
+                    inner_size.0,
+                    inner_size.1,
+                    cx,
+                );
+                self.rounded_wallpaper = cache;
+                res
+            };
+            if let Some(cropped) = cropped {
+                let el = img(ImageSource::Render(cropped.clone()))
+                    .size_full()
+                    .object_fit(ObjectFit::Fill)
+                    .rounded_tl(corners.tl)
+                    .rounded_tr(corners.tr)
+                    .rounded_br(corners.br)
+                    .rounded_bl(corners.bl);
+                if cropped.frame_count() > 1 {
+                    el.id(("wallpaper-anim", cropped.id.0)).into_any_element()
+                } else {
+                    el.into_any_element()
+                }
+            } else {
+                img(ImageSource::from(wallpaper.preview))
                     .size_full()
                     .object_fit(ObjectFit::Cover)
                     .into_any_element()
             }
-            WallpaperContent::Video { .. } => {
-                if let Some(frame) = &enki.video_frame {
-                    img(ImageSource::Render(frame.clone()))
-                        .size_full()
-                        .object_fit(ObjectFit::Cover)
-                        .into_any_element()
-                } else {
-                    img(ImageSource::from(wallpaper.preview.clone()))
+        } else {
+            self.rounded_wallpaper.clear(cx);
+            let enki = self.model.read(cx);
+            let wallpaper = enki.wallpaper.as_ref()?;
+            match &wallpaper.content {
+                WallpaperContent::Static => img(ImageSource::from(wallpaper.preview.clone()))
+                    .size_full()
+                    .object_fit(ObjectFit::Cover)
+                    .into_any_element(),
+                WallpaperContent::Animated(render_img) => {
+                    img(ImageSource::Render(render_img.clone()))
+                        .id(("wallpaper-anim", render_img.id.0))
                         .size_full()
                         .object_fit(ObjectFit::Cover)
                         .into_any_element()
                 }
+                WallpaperContent::Video { .. } => {
+                    if let Some(frame) = &enki.video_frame {
+                        img(ImageSource::Render(frame.clone()))
+                            .size_full()
+                            .object_fit(ObjectFit::Cover)
+                            .into_any_element()
+                    } else {
+                        img(ImageSource::from(wallpaper.preview.clone()))
+                            .size_full()
+                            .object_fit(ObjectFit::Cover)
+                            .into_any_element()
+                    }
+                }
             }
         };
+
         Some(
             div()
                 .absolute()
                 .inset_0()
                 .overflow_hidden()
+                .rounded_tl(corners.tl)
+                .rounded_tr(corners.tr)
+                .rounded_br(corners.br)
+                .rounded_bl(corners.bl)
                 .child(media)
-                .child(div().absolute().inset_0().bg(with_alpha(theme.scrim, dim)))
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .rounded_tl(corners.tl)
+                        .rounded_tr(corners.tr)
+                        .rounded_br(corners.br)
+                        .rounded_bl(corners.bl)
+                        .bg(with_alpha(theme.scrim, dim)),
+                )
                 .into_any_element(),
         )
     }
 
     /// Extra shade where text sits on the image: title bar and status row.
-    fn shades(&self, cx: &App) -> Option<AnyElement> {
+    fn shades(&self, corners: WindowCorners, cx: &App) -> Option<AnyElement> {
         let theme = Theme::get(cx);
         self.model.read(cx).wallpaper.as_ref()?;
         Some(
@@ -288,6 +592,8 @@ impl RootView {
                         .left_0()
                         .right_0()
                         .h(px(120.))
+                        .rounded_tl(corners.tl)
+                        .rounded_tr(corners.tr)
                         .bg(linear_gradient(
                             180.,
                             linear_color_stop(with_alpha(theme.scrim, 0.35), 0.),
@@ -301,6 +607,8 @@ impl RootView {
                         .left_0()
                         .right_0()
                         .h(px(200.))
+                        .rounded_bl(corners.bl)
+                        .rounded_br(corners.br)
                         .bg(linear_gradient(
                             180.,
                             linear_color_stop(with_alpha(theme.scrim, 0.), 0.),
@@ -441,10 +749,11 @@ fn window_controls(theme: &Theme) -> impl IntoElement {
         ))
 }
 
-/// Invisible strips along the edges that start an interactive resize when
-/// the compositor leaves decorations to us (GNOME on Wayland).
-fn resize_handles() -> impl IntoElement {
-    const EDGE: f32 = 6.;
+/// Invisible strips along untiled edges (covering the shadow inset + a few
+/// pixels inside the frame) that start an interactive resize on Linux CSD.
+fn resize_handles(tiling: Tiling) -> impl IntoElement {
+    let edge = f32::from(WINDOW_SHADOW_INSET) + 4.;
+    let corner = edge + 6.;
     let handle = |id: &'static str, edge: ResizeEdge| {
         div()
             .id(id)
@@ -458,66 +767,82 @@ fn resize_handles() -> impl IntoElement {
     div()
         .absolute()
         .inset_0()
-        .child(
-            handle("rz-t", ResizeEdge::Top)
-                .top_0()
-                .left(px(EDGE))
-                .right(px(EDGE))
-                .h(px(EDGE))
-                .cursor_ns_resize(),
-        )
-        .child(
-            handle("rz-b", ResizeEdge::Bottom)
-                .bottom_0()
-                .left(px(EDGE))
-                .right(px(EDGE))
-                .h(px(EDGE))
-                .cursor_ns_resize(),
-        )
-        .child(
-            handle("rz-l", ResizeEdge::Left)
-                .left_0()
-                .top(px(EDGE))
-                .bottom(px(EDGE))
-                .w(px(EDGE))
-                .cursor_ew_resize(),
-        )
-        .child(
-            handle("rz-r", ResizeEdge::Right)
-                .right_0()
-                .top(px(EDGE))
-                .bottom(px(EDGE))
-                .w(px(EDGE))
-                .cursor_ew_resize(),
-        )
-        .child(
-            handle("rz-tl", ResizeEdge::TopLeft)
-                .top_0()
-                .left_0()
-                .size(px(EDGE * 2.))
-                .cursor_nwse_resize(),
-        )
-        .child(
-            handle("rz-tr", ResizeEdge::TopRight)
-                .top_0()
-                .right_0()
-                .size(px(EDGE * 2.))
-                .cursor_nesw_resize(),
-        )
-        .child(
-            handle("rz-bl", ResizeEdge::BottomLeft)
-                .bottom_0()
-                .left_0()
-                .size(px(EDGE * 2.))
-                .cursor_nesw_resize(),
-        )
-        .child(
-            handle("rz-br", ResizeEdge::BottomRight)
-                .bottom_0()
-                .right_0()
-                .size(px(EDGE * 2.))
-                .cursor_nwse_resize(),
-        )
+        .when(!tiling.top, |d| {
+            d.child(
+                handle("rz-t", ResizeEdge::Top)
+                    .top_0()
+                    .left(px(corner))
+                    .right(px(corner))
+                    .h(px(edge))
+                    .cursor_ns_resize(),
+            )
+        })
+        .when(!tiling.bottom, |d| {
+            d.child(
+                handle("rz-b", ResizeEdge::Bottom)
+                    .bottom_0()
+                    .left(px(corner))
+                    .right(px(corner))
+                    .h(px(edge))
+                    .cursor_ns_resize(),
+            )
+        })
+        .when(!tiling.left, |d| {
+            d.child(
+                handle("rz-l", ResizeEdge::Left)
+                    .left_0()
+                    .top(px(corner))
+                    .bottom(px(corner))
+                    .w(px(edge))
+                    .cursor_ew_resize(),
+            )
+        })
+        .when(!tiling.right, |d| {
+            d.child(
+                handle("rz-r", ResizeEdge::Right)
+                    .right_0()
+                    .top(px(corner))
+                    .bottom(px(corner))
+                    .w(px(edge))
+                    .cursor_ew_resize(),
+            )
+        })
+        .when(!(tiling.top || tiling.left), |d| {
+            d.child(
+                handle("rz-tl", ResizeEdge::TopLeft)
+                    .top_0()
+                    .left_0()
+                    .size(px(corner))
+                    .cursor_nwse_resize(),
+            )
+        })
+        .when(!(tiling.top || tiling.right), |d| {
+            d.child(
+                handle("rz-tr", ResizeEdge::TopRight)
+                    .top_0()
+                    .right_0()
+                    .size(px(corner))
+                    .cursor_nesw_resize(),
+            )
+        })
+        .when(!(tiling.bottom || tiling.left), |d| {
+            d.child(
+                handle("rz-bl", ResizeEdge::BottomLeft)
+                    .bottom_0()
+                    .left_0()
+                    .size(px(corner))
+                    .cursor_nesw_resize(),
+            )
+        })
+        .when(!(tiling.bottom || tiling.right), |d| {
+            d.child(
+                handle("rz-br", ResizeEdge::BottomRight)
+                    .bottom_0()
+                    .right_0()
+                    .size(px(corner))
+                    .cursor_nwse_resize(),
+            )
+        })
 }
 
 impl Focusable for RootView {
@@ -533,9 +858,38 @@ impl Render for RootView {
             (enki.page, enki.settings.sidebar_open)
         };
         self.begin_glass(window, cx);
+
+        let client_tiling = match window.window_decorations() {
+            Decorations::Client { tiling } => Some(tiling),
+            Decorations::Server => None,
+        };
+        if client_tiling.is_some() {
+            window.set_client_inset(WINDOW_SHADOW_INSET);
+        }
+        let corners = client_tiling
+            .map(WindowCorners::from_tiling)
+            .unwrap_or_default();
+
+        let mut inner = window.viewport_size();
+        if let Some(tiling) = client_tiling {
+            if !tiling.left {
+                inner.width -= WINDOW_SHADOW_INSET;
+            }
+            if !tiling.right {
+                inner.width -= WINDOW_SHADOW_INSET;
+            }
+            if !tiling.top {
+                inner.height -= WINDOW_SHADOW_INSET;
+            }
+            if !tiling.bottom {
+                inner.height -= WINDOW_SHADOW_INSET;
+            }
+        }
+        let inner_size = (f32::from(inner.width).max(1.), f32::from(inner.height).max(1.));
+
         let title = self.page_title(cx);
-        let background = self.background(cx);
-        let shades = self.shades(cx);
+        let background = self.background(corners, inner_size, cx);
+        let shades = self.shades(corners, cx);
         let titlebar = self
             .titlebar(title, sidebar_open, window, cx)
             .into_any_element();
@@ -546,19 +900,37 @@ impl Render for RootView {
             Page::Wrapped => wrapped_page::render(self, window, cx),
             Page::Settings(section) => settings_page::render(self, section, window, cx),
         };
-        let sidebar = sidebar_open.then(|| sidebar::render(self, window, cx));
+        let sidebar =
+            sidebar_open.then(|| sidebar::render(self, corners.tl, corners.bl, window, cx));
         let error_toast = self.error_toast(cx);
-        // Drawn edges only while floating; maximized or tiled, the window meets the screen edge.
-        let floating = matches!(
-            window.window_decorations(),
-            Decorations::Client { tiling } if !tiling.is_tiled()
-        );
 
-        let theme = Theme::get(cx);
-        let has_background = self.model.read(cx).wallpaper.is_some();
+        let theme = Theme::get(cx).clone();
         let liquid = theme.liquid();
 
-        div()
+        let has_untiled_edge = |t: Tiling| !(t.top && t.bottom && t.left && t.right);
+        let window_outline = client_tiling.and_then(|tiling| {
+            has_untiled_edge(tiling).then(|| {
+                let rim = if theme.is_dark {
+                    with_alpha(gpui::white(), 0.12)
+                } else {
+                    with_alpha(gpui::black(), 0.14)
+                };
+                div()
+                    .absolute()
+                    .inset_0()
+                    .rounded_tl(corners.tl)
+                    .rounded_tr(corners.tr)
+                    .rounded_br(corners.br)
+                    .rounded_bl(corners.bl)
+                    .when(!tiling.top, |d| d.border_t_1())
+                    .when(!tiling.bottom, |d| d.border_b_1())
+                    .when(!tiling.left, |d| d.border_l_1())
+                    .when(!tiling.right, |d| d.border_r_1())
+                    .border_color(rim)
+            })
+        });
+
+        let root = div()
             .id("root")
             .key_context("Enki")
             .track_focus(&self.focus_handle)
@@ -587,9 +959,6 @@ impl Render for RootView {
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .when(!has_background && !theme.native_backdrop, |d| {
-                        d.bg(theme.window_bg)
-                    })
                     .when(sidebar_open && !liquid, |d| {
                         d.border_l_1().border_color(theme.border)
                     })
@@ -597,13 +966,82 @@ impl Render for RootView {
                     .child(div().flex().flex_col().flex_1().min_h_0().child(body)),
             )
             .children(error_toast)
-            .when(floating, |d| d.child(resize_handles()))
+            .children(window_outline)
             // Painted last: hides glass views nothing placed this frame.
             .child(
                 canvas(|_, _, _| {}, |_, _, window, _| native::glass_end(window))
                     .absolute()
                     .size_0(),
             )
-            .when(floating, |d| d.rounded(radius::LG).overflow_hidden())
+            .when(corners.any(), |d| {
+                d.rounded_tl(corners.tl)
+                    .rounded_tr(corners.tr)
+                    .rounded_br(corners.br)
+                    .rounded_bl(corners.bl)
+                    .overflow_hidden()
+            })
+            .when(
+                client_tiling.is_some_and(|t| !t.is_tiled()),
+                |d| {
+                    d.shadow(vec![BoxShadow {
+                        color: with_alpha(
+                            gpui::black(),
+                            if theme.is_dark { 0.45 } else { 0.22 },
+                        ),
+                        offset: point(px(0.), px(2.)),
+                        blur_radius: px(10.),
+                        spread_radius: px(-1.),
+                    }])
+                },
+            );
+
+        if let Some(tiling) = client_tiling {
+            div()
+                .relative()
+                .size_full()
+                .bg(gpui::transparent_black())
+                .when(!tiling.top, |d| d.pt(WINDOW_SHADOW_INSET))
+                .when(!tiling.bottom, |d| d.pb(WINDOW_SHADOW_INSET))
+                .when(!tiling.left, |d| d.pl(WINDOW_SHADOW_INSET))
+                .when(!tiling.right, |d| d.pr(WINDOW_SHADOW_INSET))
+                .child(root)
+                .when(has_untiled_edge(tiling), |d| {
+                    d.child(resize_handles(tiling))
+                })
+                .into_any_element()
+        } else {
+            root.into_any_element()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crop_rect_for_aspect_centers_wide_and_tall_sources() {
+        // 16:9 image into 3:2 window -> trims left & right equally.
+        assert_eq!(crop_rect_for_aspect(1920, 1080, 1080., 720.), (150, 0, 1620, 1080));
+        // 1:1 image into 3:2 window -> trims top & bottom equally.
+        assert_eq!(crop_rect_for_aspect(1200, 1200, 1080., 720.), (0, 200, 1200, 800));
+        // Already matching aspect -> no crop.
+        assert_eq!(crop_rect_for_aspect(1080, 720, 1080., 720.), (0, 0, 1080, 720));
+    }
+
+    #[test]
+    fn crop_bgra_frame_extracts_centered_pixels() {
+        // 4x2 image: each pixel encodes its (x, y) coordinates.
+        let mut src = Vec::with_capacity(4 * 2 * 4);
+        for y in 0..2u8 {
+            for x in 0..4u8 {
+                src.extend_from_slice(&[x, y, 0, 255]);
+            }
+        }
+        // Target 1:1 -> center 2x2 slice (x = 1..3, y = 0..2).
+        let cropped = crop_bgra_frame(&src, 4, 2, 100., 100.).expect("cropped");
+        assert_eq!(cropped.dimensions(), (2, 2));
+        assert_eq!(cropped.get_pixel(0, 0).0, [1, 0, 0, 255]);
+        assert_eq!(cropped.get_pixel(1, 1).0, [2, 1, 0, 255]);
     }
 }

@@ -1,12 +1,15 @@
 //! The application model shared by every window: timer, tasks, stats,
 //! settings and the background services (media, tray, wallpaper).
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use chrono::{Local, NaiveDate};
 
 use gpui::{
-    App, AppContext as _, AsyncApp, Context, Entity, Global, Rgba, Task, WeakEntity,
+    App, AppContext as _, AsyncApp, Context, Entity, Global, RenderImage, Rgba, Task, WeakEntity,
     WindowAppearance,
 };
 
@@ -21,7 +24,8 @@ use crate::{
     theme::Theme,
     timer::{format_clock, Finished, Phase, Timer},
     tray::{Tray, TrayAction},
-    wallpaper::{self, Wallpaper},
+    video::VideoPlayer,
+    wallpaper::{self, Wallpaper, WallpaperContent},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -198,6 +202,8 @@ pub struct Enki {
     pub intention: String,
     pub page: Page,
     pub wallpaper: Option<Wallpaper>,
+    /// Current decoded frame for GPUI-rendered video wallpapers (Linux / fallback).
+    pub video_frame: Option<Arc<RenderImage>>,
     pub now_playing: Option<NowPlaying>,
     pub system_dark: bool,
     pub error: Option<String>,
@@ -212,6 +218,8 @@ pub struct Enki {
     tray_failed: bool,
     _tick: Task<()>,
     wallpaper_job: Option<Task<()>>,
+    video_player: Option<VideoPlayer>,
+    _video_pump: Option<Task<()>>,
 }
 
 pub struct AppModel(pub Entity<Enki>);
@@ -257,6 +265,7 @@ impl Enki {
             intention: String::new(),
             page: Page::Timer,
             wallpaper: None,
+            video_frame: None,
             now_playing: None,
             system_dark: is_dark(cx.window_appearance()),
             error,
@@ -268,6 +277,8 @@ impl Enki {
             tray_failed: false,
             _tick: tick,
             wallpaper_job: None,
+            video_player: None,
+            _video_pump: None,
         };
         enki.reload_tasks();
         enki.reload_stats();
@@ -282,7 +293,11 @@ impl Enki {
 
     pub fn build_theme(&self) -> Theme {
         let tint: Option<Rgba> = self.wallpaper.as_ref().map(|w| w.tint);
-        Theme::build(&self.settings, self.system_dark, tint)
+        let has_native_video = self
+            .wallpaper
+            .as_ref()
+            .is_some_and(Wallpaper::is_native_video);
+        Theme::build(&self.settings, self.system_dark, tint, has_native_video)
     }
 
     pub fn apply_theme(&self, cx: &mut App) {
@@ -362,16 +377,73 @@ impl Enki {
 
     // ---- Wallpaper ---------------------------------------------------------
 
+    fn stop_video_player(&mut self, cx: &mut Context<Self>) {
+        self.video_player = None;
+        self._video_pump = None;
+        if let Some(frame) = self.video_frame.take() {
+            cx.drop_image(frame, None);
+        }
+    }
+
+    fn set_wallpaper(&mut self, next: Option<Wallpaper>, cx: &mut Context<Self>) {
+        self.stop_video_player(cx);
+        if let Some(prev) = self.wallpaper.take() {
+            if let WallpaperContent::Animated(img) = prev.content {
+                cx.drop_image(img, None);
+            }
+        }
+        if let Some(Wallpaper {
+            content:
+                WallpaperContent::Video {
+                    ref path,
+                    blur_sigma,
+                    width,
+                    height,
+                    native_mac: false,
+                },
+            ..
+        }) = next
+        {
+            if let Some(player) = VideoPlayer::spawn(path, width, height, blur_sigma) {
+                self.video_player = Some(player);
+                self._video_pump = Some(cx.spawn(async move |this, cx| loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(20))
+                        .await;
+                    let keep_going = this
+                        .update(cx, |this, cx| {
+                            let Some(player) = &this.video_player else {
+                                return false;
+                            };
+                            if let Some(frame) = player.take_frame() {
+                                if let Some(old) = this.video_frame.replace(frame) {
+                                    cx.drop_image(old, None);
+                                }
+                                cx.notify();
+                            }
+                            true
+                        })
+                        .unwrap_or(false);
+                    if !keep_going {
+                        break;
+                    }
+                }));
+            }
+        }
+        self.wallpaper = next;
+    }
+
     fn load_wallpaper(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.settings.background_image.clone() else {
-            self.wallpaper = None;
+            self.set_wallpaper(None, cx);
             self.wallpaper_job = None;
             return;
         };
         let effect = self.settings.background_effect;
         // Screenshots of a locked/occluded session only get the first frame.
         if cfg!(debug_assertions) && std::env::var("ENKI_DEBUG_SYNC").is_ok() {
-            self.wallpaper = wallpaper::process(&path, effect).ok();
+            let wp = wallpaper::process(&path, effect).ok();
+            self.set_wallpaper(wp, cx);
             return;
         }
         let job = cx
@@ -382,12 +454,13 @@ impl Enki {
             this.update(cx, |this, cx| {
                 match result {
                     Ok(wallpaper) => {
-                        this.wallpaper = Some(wallpaper);
+                        this.set_wallpaper(Some(wallpaper), cx);
                         this.error = None;
                     }
                     Err(err) => {
-                        this.wallpaper = None;
-                        this.error = Some(format!("Não foi possível carregar a imagem: {err:#}"));
+                        this.set_wallpaper(None, cx);
+                        this.error =
+                            Some(format!("Não foi possível carregar o fundo: {err:#}"));
                     }
                 }
                 this.apply_theme(cx);

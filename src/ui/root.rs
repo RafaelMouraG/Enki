@@ -20,6 +20,7 @@ use crate::{
         text_input::{TextInput, TextInputEvent},
         timer_page, wrapped_page,
     },
+    wallpaper::WallpaperContent,
 };
 
 pub const TITLEBAR_HEIGHT: f32 = 52.;
@@ -227,23 +228,46 @@ impl RootView {
             .into_any_element()
     }
 
-    /// The wallpaper drawn by GPUI. With native glass the backdrop is a
-    /// native view under the glass instead, so this draws nothing.
+    /// The wallpaper drawn by GPUI. When a native backdrop is active (macOS
+    /// Liquid Glass or native video player), the backdrop sits under GPUI
+    /// instead, so this draws nothing.
     fn background(&self, cx: &App) -> Option<AnyElement> {
         let theme = Theme::get(cx);
         let enki = self.model.read(cx);
-        let wallpaper = enki.wallpaper.as_ref().filter(|_| !theme.native_glass)?;
+        let wallpaper = enki.wallpaper.as_ref().filter(|_| !theme.native_backdrop)?;
         let dim = enki.settings.background_dim as f32 / 100.0;
+        let media: AnyElement = match &wallpaper.content {
+            WallpaperContent::Static => img(ImageSource::from(wallpaper.preview.clone()))
+                .size_full()
+                .object_fit(ObjectFit::Cover)
+                .into_any_element(),
+            WallpaperContent::Animated(render_img) => {
+                img(ImageSource::Render(render_img.clone()))
+                    .id(("wallpaper-anim", render_img.id.0))
+                    .size_full()
+                    .object_fit(ObjectFit::Cover)
+                    .into_any_element()
+            }
+            WallpaperContent::Video { .. } => {
+                if let Some(frame) = &enki.video_frame {
+                    img(ImageSource::Render(frame.clone()))
+                        .size_full()
+                        .object_fit(ObjectFit::Cover)
+                        .into_any_element()
+                } else {
+                    img(ImageSource::from(wallpaper.preview.clone()))
+                        .size_full()
+                        .object_fit(ObjectFit::Cover)
+                        .into_any_element()
+                }
+            }
+        };
         Some(
             div()
                 .absolute()
                 .inset_0()
                 .overflow_hidden()
-                .child(
-                    img(ImageSource::from(wallpaper.rendered.clone()))
-                        .size_full()
-                        .object_fit(ObjectFit::Cover),
-                )
+                .child(media)
                 .child(div().absolute().inset_0().bg(with_alpha(theme.scrim, dim)))
                 .into_any_element(),
         )
@@ -330,14 +354,26 @@ impl RootView {
         )
     }
 
-    /// Starts the native glass frame: backdrop under everything, or nothing.
+    /// Starts the native glass / native video backdrop frame.
     fn begin_glass(&self, window: &Window, cx: &App) {
         let theme = Theme::get(cx);
         let enki = self.model.read(cx);
-        let backdrop = theme.native_glass.then(|| native::Backdrop {
-            color: theme.window_bg,
-            wallpaper: enki.wallpaper.as_ref().map(|w| w.rendered.as_path()),
-            dim: with_alpha(theme.scrim, enki.settings.background_dim as f32 / 100.0),
+        let backdrop = theme.native_backdrop.then(|| {
+            let media = enki.wallpaper.as_ref().map(|w| match &w.content {
+                WallpaperContent::Static => native::BackdropMedia::Image(w.preview.as_path()),
+                WallpaperContent::Animated(img) => native::BackdropMedia::Animated(img.clone()),
+                WallpaperContent::Video {
+                    path, blur_sigma, ..
+                } => native::BackdropMedia::Video {
+                    path: path.as_path(),
+                    blur_sigma: *blur_sigma,
+                },
+            });
+            native::Backdrop {
+                color: theme.window_bg,
+                media,
+                dim: with_alpha(theme.scrim, enki.settings.background_dim as f32 / 100.0),
+            }
         });
         native::glass_begin(window, theme.native_glass, backdrop);
     }
@@ -537,7 +573,7 @@ impl Render for RootView {
             .font_family(UI_FONT)
             .text_size(px(14.))
             .text_color(theme.text)
-            .when(!theme.native_glass, |d| d.bg(theme.window_bg))
+            .when(!theme.native_backdrop, |d| d.bg(theme.window_bg))
             .children(background)
             // Over the whole window, or the floating sidebar's gaps show a seam.
             .children(shades)
@@ -551,7 +587,7 @@ impl Render for RootView {
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .when(!has_background && !theme.native_glass, |d| {
+                    .when(!has_background && !theme.native_backdrop, |d| {
                         d.bg(theme.window_bg)
                     })
                     .when(sidebar_open && !liquid, |d| {

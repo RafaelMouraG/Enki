@@ -12,6 +12,8 @@ pub struct Theme {
     pub reduce_motion: bool,
     /// Glass surfaces are real macOS Liquid Glass views under GPUI's content.
     pub native_glass: bool,
+    /// Native macOS view draws the backdrop (Liquid Glass or native video player).
+    pub native_backdrop: bool,
     /// Glass surfaces are drawn: translucent fill plus a lit rim.
     pub drawn_glass: bool,
 
@@ -72,13 +74,19 @@ impl Theme {
         cx.global::<Theme>()
     }
 
-    pub fn build(settings: &Settings, system_dark: bool, wallpaper_tint: Option<Rgba>) -> Self {
+    pub fn build(
+        settings: &Settings,
+        system_dark: bool,
+        wallpaper_tint: Option<Rgba>,
+        has_native_video: bool,
+    ) -> Self {
         let is_dark = match settings.color_scheme {
             ColorScheme::System => system_dark,
             ColorScheme::Light => false,
             ColorScheme::Dark => true,
         };
         let native_glass = settings.glass == Glass::Liquid && crate::native::glass_supported();
+        let native_backdrop = native_glass || has_native_video;
         let drawn_glass = settings.glass == Glass::Liquid && !native_glass;
         // Drawn glass only reads as glass over an image; on a flat color it's just a panel.
         let translucent =
@@ -118,6 +126,7 @@ impl Theme {
                 is_dark,
                 reduce_motion: settings.reduce_motion,
                 native_glass,
+                native_backdrop,
                 drawn_glass,
                 window_bg: t(0x14181d),
                 sidebar_bg: with_alpha(t(0x1a1e23), sidebar_alpha),
@@ -163,6 +172,7 @@ impl Theme {
                 is_dark,
                 reduce_motion: settings.reduce_motion,
                 native_glass,
+                native_backdrop,
                 drawn_glass,
                 window_bg: t(0xffffff),
                 sidebar_bg: with_alpha(t(0xf3f4f6), sidebar_alpha),

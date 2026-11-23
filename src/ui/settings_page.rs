@@ -607,7 +607,7 @@ fn appearance(
                 files: true,
                 directories: false,
                 multiple: false,
-                prompt: Some("Usar imagem".into()),
+                prompt: Some("Usar fundo".into()),
             });
             let model = model.clone();
             cx.spawn(async move |cx| {
@@ -631,13 +631,21 @@ fn appearance(
         .and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().to_string());
     let thumb: AnyElement = match &wallpaper {
-        Some(wp) => img(ImageSource::from(wp.rendered.clone()))
+        Some(wp) => div()
             .size(px(40.))
+            .flex_none()
             .rounded(radius::MD)
-            .object_fit(ObjectFit::Cover)
+            .overflow_hidden()
+            .child(
+                img(ImageSource::from(wp.thumb.clone()))
+                    .size_full()
+                    .rounded(radius::MD)
+                    .object_fit(ObjectFit::Cover),
+            )
             .into_any_element(),
         None => div()
             .flex()
+            .flex_none()
             .items_center()
             .justify_center()
             .size(px(40.))
@@ -650,9 +658,9 @@ fn appearance(
     let pick_btn = button(
         "pick-image",
         if image_name.is_some() {
-            "Substituir imagem"
+            "Substituir"
         } else {
-            "Escolher imagem"
+            "Escolher arquivo"
         },
         ButtonKind::Secondary,
         theme_ref,
@@ -691,18 +699,16 @@ fn appearance(
                     div()
                         .text_size(px(14.))
                         .font_weight(FontWeight::MEDIUM)
-                        .child("Imagem de fundo"),
+                        .child("Plano de fundo"),
                 )
                 .child(
                     div()
                         .ellipsis()
                         .text_size(px(12.5))
                         .text_color(theme_ref.text_muted)
-                        .child(
-                            image_name
-                                .clone()
-                                .unwrap_or_else(|| "Nenhuma imagem. Fica atrás do timer.".into()),
-                        ),
+                        .child(image_name.clone().unwrap_or_else(|| {
+                            "Imagens (PNG, JPG, WebP, GIF, HEIC…) e vídeos (MP4, MOV, WebM).".into()
+                        })),
                 ),
         )
         .child(pick_btn)
@@ -727,7 +733,7 @@ fn appearance(
                 }
                 Glass::Liquid => "Barra lateral flutuante e controles com bordas de vidro.".into(),
                 Glass::Translucent => {
-                    "Com imagem de fundo, a barra lateral fica translúcida sobre ela.".into()
+                    "Com plano de fundo, a barra lateral fica translúcida sobre ele.".into()
                 }
                 Glass::Solid => "Superfícies opacas.".into(),
             }),
@@ -739,8 +745,8 @@ fn appearance(
             false,
             "Efeito de fundo",
             Some(match s.background_effect {
-                BackgroundEffect::None => "Mostra a imagem original.".into(),
-                _ => "Desfoca a imagem para o timer se destacar.".into(),
+                BackgroundEffect::None => "Mostra o fundo original.".into(),
+                _ => "Desfoca o fundo para o timer se destacar.".into(),
             }),
             effect,
         ))
@@ -748,7 +754,7 @@ fn appearance(
             theme,
             false,
             "Escurecer fundo",
-            Some("Quanto a imagem é coberta pela cor do tema.".into()),
+            Some("Quanto o fundo é coberto pela cor do tema.".into()),
             dim,
         ));
 

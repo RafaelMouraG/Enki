@@ -17,10 +17,12 @@ use crate::{
             button, card, icon, icon_sized, page_title, section_label, ButtonKind, StyledExt as _,
             SurfaceExt as _,
         },
-        format_minutes, on_model,
+        content_viewport, format_minutes, on_model, page_padding_x,
         root::RootView,
     },
 };
+
+const PAGE_MAX_W: f32 = 820.;
 
 pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootView>) -> AnyElement {
     let model = view.model.clone();
@@ -39,7 +41,7 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
 
     let theme = Theme::get(cx).clone();
     let theme = &theme;
-    let (stats, today_stat, today_date, goal, recent_sessions) = {
+    let (stats, today_stat, today_date, goal, recent_sessions, sidebar_open) = {
         let enki = model.read(cx);
         let stats = enki.stats.clone();
         let today_stat = stats.today();
@@ -54,8 +56,12 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
             today_date,
             enki.settings.daily_goal.max(1),
             enki.recent_sessions.clone(),
+            enki.settings.sidebar_open,
         )
     };
+    let (avail_w, _) = content_viewport(window, sidebar_open);
+    let pad_x = page_padding_x(avail_w);
+    let inner_w = avail_w.min(PAGE_MAX_W) - 2. * pad_x;
 
     let export_csv = {
         let model = model.clone();
@@ -143,12 +149,14 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
         .child(
             div()
                 .flex()
+                .flex_wrap()
                 .items_center()
                 .gap(px(8.))
                 .child(add_manual_btn)
                 .child(export_csv_btn),
         );
 
+    let tile_value_size = if inner_w < 440. { 22. } else { 28. };
     let tile = |glyph: Icon, label: &'static str, value: String, hint: String, color: Hsla| {
         div()
             .relative()
@@ -156,7 +164,7 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
             .flex_col()
             .gap(px(10.))
             .flex_1()
-            .min_w(px(150.))
+            .min_w_0()
             .p(px(16.))
             .rounded(radius::LG)
             .surface(format!("stats-tile-{label}"), radius::LG, theme)
@@ -170,6 +178,7 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
                     .child(
                         div()
                             .flex()
+                            .flex_none()
                             .items_center()
                             .justify_center()
                             .size(px(24.))
@@ -177,14 +186,15 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
                             .bg(with_alpha(color, 0.16))
                             .child(icon_sized(glyph, px(14.), color)),
                     )
-                    .child(label),
+                    .child(div().min_w_0().ellipsis_child(label)),
             )
             .child(
                 div()
-                    .text_size(px(28.))
+                    .text_size(px(tile_value_size))
                     .font(tabular_font())
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme.text)
+                    .whitespace_nowrap()
                     .child(value),
             )
             .child(
@@ -201,50 +211,64 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
         Some(rate) => format!("{} pomodoros · {rate}% concluídos", stats.total_pomodoros),
         None => format!("{} pomodoros no total", stats.total_pomodoros),
     };
-    let tiles = div()
-        .flex()
-        .flex_wrap()
-        .gap(px(12.))
-        .child(tile(
-            Icon::Tomato,
-            "Hoje",
-            today_stat.pomodoros.to_string(),
-            format!("meta de {goal}"),
-            theme.accent,
-        ))
-        .child(tile(
-            Icon::Clock,
-            "Foco hoje",
-            format_minutes(today_stat.focus_seconds),
-            format!("{} nos últimos 7 dias", format_minutes(week_seconds)),
-            theme.rest,
-        ))
-        .child(tile(
-            Icon::Flame,
-            "Sequência",
-            format!(
-                "{} {}",
-                stats.streak,
-                if stats.streak == 1 { "dia" } else { "dias" }
-            ),
-            "dias seguidos com foco".into(),
-            gpui::rgb(0xf0954a).into(),
-        ))
-        .child(tile(
-            Icon::Trophy,
-            "Recorde",
-            format!(
-                "{} {}",
-                stats.best_streak,
-                if stats.best_streak == 1 {
-                    "dia"
-                } else {
-                    "dias"
-                }
-            ),
-            record_hint,
-            gpui::rgb(0xf2c14e).into(),
-        ));
+    let t_today = tile(
+        Icon::Tomato,
+        "Hoje",
+        today_stat.pomodoros.to_string(),
+        format!("meta de {goal}"),
+        theme.accent,
+    );
+    let t_focus = tile(
+        Icon::Clock,
+        "Foco hoje",
+        format_minutes(today_stat.focus_seconds),
+        format!("{} nos últimos 7 dias", format_minutes(week_seconds)),
+        theme.rest,
+    );
+    let t_streak = tile(
+        Icon::Flame,
+        "Sequência",
+        format!(
+            "{} {}",
+            stats.streak,
+            if stats.streak == 1 { "dia" } else { "dias" }
+        ),
+        "dias seguidos com foco".into(),
+        gpui::rgb(0xf0954a).into(),
+    );
+    let t_record = tile(
+        Icon::Trophy,
+        "Recorde",
+        format!(
+            "{} {}",
+            stats.best_streak,
+            if stats.best_streak == 1 {
+                "dia"
+            } else {
+                "dias"
+            }
+        ),
+        record_hint,
+        gpui::rgb(0xf2c14e).into(),
+    );
+    let tiles: AnyElement = if inner_w >= 640. {
+        div()
+            .flex()
+            .gap(px(12.))
+            .child(t_today)
+            .child(t_focus)
+            .child(t_streak)
+            .child(t_record)
+            .into_any_element()
+    } else {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(div().flex().gap(px(12.)).child(t_today).child(t_focus))
+            .child(div().flex().gap(px(12.)).child(t_streak).child(t_record))
+            .into_any_element()
+    };
 
     let daily_avg = week_seconds / 7;
     let delta = week_delta_label(week_seconds, stats.prev_week_focus_seconds);
@@ -282,7 +306,7 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
         );
 
     let bars = bars_content(week, hovered_bar, bars_hover, theme);
-    let heatmap = heatmap_content(&stats.days, hovered_heatmap, heatmap_hover, theme);
+    let heatmap = heatmap_content(&stats.days, hovered_heatmap, heatmap_hover, inner_w >= 600., theme);
 
     let sessions_subtitle = match stats.completion_rate() {
         Some(rate) => format!(
@@ -316,9 +340,9 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
                 .flex_col()
                 .gap(px(16.))
                 .w_full()
-                .max_w(px(820.))
+                .max_w(px(PAGE_MAX_W))
                 .mx_auto()
-                .px(px(32.))
+                .px(px(pad_x))
                 .pt(px(24.))
                 .pb(px(48.))
                 .child(header)
@@ -462,6 +486,7 @@ fn heatmap_content(
     days: &[(NaiveDate, DayStat)],
     hovered: Option<(NaiveDate, DayStat)>,
     hover_state: Entity<Option<(NaiveDate, DayStat)>>,
+    center: bool,
     theme: &Theme,
 ) -> impl IntoElement {
     const CELL: f32 = 16.;
@@ -584,9 +609,9 @@ fn heatmap_content(
             div()
                 .id("heatmap-scroll")
                 .flex()
-                .justify_center()
+                .when(center, |d| d.justify_center())
                 .overflow_x_scroll()
-                .child(div().flex().child(labels).child(grid)),
+                .child(div().flex().flex_none().child(labels).child(grid)),
         )
         .child(footer)
 }
@@ -695,7 +720,6 @@ fn recent_sessions_card(
                         .min_w_0()
                         .child(
                             div()
-                                .ellipsis()
                                 .text_size(px(13.5))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(if session.completed {
@@ -703,7 +727,7 @@ fn recent_sessions_card(
                                 } else {
                                     theme.text_muted
                                 })
-                                .child(title),
+                                .ellipsis_child(title),
                         )
                         .child(
                             div()

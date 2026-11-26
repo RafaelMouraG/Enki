@@ -17,7 +17,7 @@ use crate::{
             ease_out_cubic, glass, glass_shadow, glass_styled, hover_track, icon, icon_sized,
             liquid_highlights, segmented, ClickHandler, SegmentOption, StyledExt as _,
         },
-        format_minutes, on_model, player,
+        content_viewport, format_minutes, on_model, page_padding_x, player,
         ring::{mini_ring, ring},
         root::RootView,
     },
@@ -48,6 +48,7 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
         today,
         streak,
         goal,
+        sidebar_open,
     ) = {
         let enki = model.read(cx);
         let timer = &enki.timer;
@@ -67,8 +68,21 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
             enki.stats.today(),
             enki.stats.streak,
             enki.settings.daily_goal.max(1),
+            enki.settings.sidebar_open,
         )
     };
+    let (avail_w, avail_h) = content_viewport(window, sidebar_open);
+    let pad_x = page_padding_x(avail_w);
+    let ring_size = if avail_h < 600. || avail_w < 440. {
+        (avail_h * 0.44)
+            .min(avail_w - 2. * pad_x - 16.)
+            .clamp(200., RING)
+    } else {
+        RING
+    };
+    let clock_font_size = (ring_size * (76. / RING)).round();
+    let clock_line_height = (ring_size * (84. / RING)).round();
+    let main_gap = if avail_h < 580. { 16. } else { 28. };
     let color = theme.phase_color(phase.is_break());
     let liquid = theme.liquid();
 
@@ -101,8 +115,8 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
         .gap(px(6.))
         .child(
             div()
-                .text_size(px(76.))
-                .line_height(px(84.))
+                .text_size(px(clock_font_size))
+                .line_height(px(clock_line_height))
                 .font(clock_font(FontWeight::LIGHT))
                 .text_color(theme.text)
                 .child(clock_text),
@@ -123,10 +137,10 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
         .flex()
         .items_center()
         .justify_center()
-        .size(px(RING))
+        .size(px(ring_size))
         .child(div().absolute().inset_0().child(ring(
             progress,
-            px(RING),
+            px(ring_size),
             px(7.),
             theme.ring_track,
             color,
@@ -416,7 +430,8 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
                 .flex()
                 .items_center()
                 .gap(px(8.))
-                .w(px(320.))
+                .w_full()
+                .max_w(px(320.))
                 .h(px(34.))
                 .px(px(12.))
                 .rounded_full()
@@ -499,7 +514,7 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
                                 .size(px(13.))
                                 .text_color(theme.accent_text),
                         )
-                        .child(div().max_w(px(360.)).ellipsis().child(title))
+                        .child(div().max_w(px(360.)).ellipsis_child(title))
                         .child(
                             div()
                                 .id("complete-current-task")
@@ -542,19 +557,24 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
     let status_bar = div()
         .flex()
         .flex_none()
+        .flex_wrap()
         .items_center()
         .justify_between()
+        .gap_x(px(12.))
+        .gap_y(px(4.))
         .w_full()
         .max_w(px(560.))
-        .h(px(36.))
+        .min_h(px(36.))
         .px(px(4.))
         .text_size(px(12.5))
         .text_color(theme.text_muted)
         .child(
             div()
                 .flex()
+                .flex_wrap()
                 .items_center()
-                .gap(px(16.))
+                .gap_x(px(16.))
+                .gap_y(px(4.))
                 .child(
                     div()
                         .flex()
@@ -594,7 +614,7 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
         .flex_col()
         .items_center()
         .size_full()
-        .px(px(32.))
+        .px(px(pad_x))
         .pb(px(16.))
         .overflow_y_scroll()
         .child(
@@ -605,7 +625,7 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
                 .justify_center()
                 .flex_1()
                 .w_full()
-                .gap(px(28.))
+                .gap(px(main_gap))
                 .py(px(12.))
                 .child(phase_bar)
                 .child(ring_block)

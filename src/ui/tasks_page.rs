@@ -15,10 +15,12 @@ use crate::{
         components::{
             button, card, icon, icon_sized, page_title, section_label, ButtonKind, SurfaceExt as _,
         },
-        on_model,
+        content_viewport, on_model, page_padding_x,
         root::RootView,
     },
 };
+
+const PAGE_MAX_W: f32 = 720.;
 
 pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootView>) -> AnyElement {
     let input_focused = view.task_input.focus_handle(cx).is_focused(window);
@@ -27,14 +29,19 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
     let editing_task = view.editing_task.clone();
     let edit_task_input = view.edit_task_input.clone();
     let theme = Theme::get(cx).clone();
-    let (open, done, current): (Vec<Task>, Vec<Task>, Option<String>) = {
+    let (open, done, current, sidebar_open): (Vec<Task>, Vec<Task>, Option<String>, bool) = {
         let enki = model.read(cx);
         (
             enki.open_tasks().cloned().collect(),
             enki.tasks.iter().filter(|t| t.done).cloned().collect(),
             enki.current_task.clone(),
+            enki.settings.sidebar_open,
         )
     };
+    let (avail_w, _) = content_viewport(window, sidebar_open);
+    let pad_x = page_padding_x(avail_w);
+    let inner_w = avail_w.min(PAGE_MAX_W) - 2. * pad_x;
+    let compact = inner_w < 460.;
 
     let summary = match (open.len(), done.len()) {
         (0, 0) => {
@@ -140,6 +147,7 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
     let add_row = div()
         .relative()
         .flex()
+        .flex_shrink_0()
         .items_center()
         .gap(px(10.))
         .h(px(48.))
@@ -156,13 +164,15 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
         .child(icon_sized(Icon::Plus, px(16.), theme.text_faint))
         .child(view.task_input.clone())
         .child(estimate_picker)
-        .child(
-            div()
-                .flex_none()
-                .text_size(px(12.))
-                .text_color(theme.text_faint)
-                .child("Enter para adicionar"),
-        );
+        .when(!compact, |d| {
+            d.child(
+                div()
+                    .flex_none()
+                    .text_size(px(12.))
+                    .text_color(theme.text_faint)
+                    .child("Enter para adicionar"),
+            )
+        });
 
     let row = |task: Task,
                first: bool,
@@ -230,7 +240,6 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
                 .id(SharedString::from(format!("title-{}", task.id)))
                 .flex_1()
                 .min_w_0()
-                .ellipsis()
                 .text_size(px(14.))
                 .text_color(if task.done {
                     theme.text_faint
@@ -245,7 +254,7 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
                         }
                     }))
                 })
-                .child(task.title.clone())
+                .ellipsis_child(task.title.clone())
                 .into_any_element()
         };
 
@@ -267,7 +276,11 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
                         .flex_none()
                         .text_size(px(12.))
                         .text_color(theme.text_faint)
-                        .child("Enter salvar · Esc cancelar"),
+                        .child(if compact {
+                            "Enter · Esc"
+                        } else {
+                            "Enter salvar · Esc cancelar"
+                        }),
                 )
                 .into_any_element();
         }
@@ -481,14 +494,16 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
             .child(check)
             .child(title_slot)
             .child(estimate)
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .justify_center()
-                    .w(px(92.))
-                    .children(focus_button),
-            )
+            .when(!compact || focus_button.is_some(), |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .justify_center()
+                        .when(!compact, |d| d.w(px(92.)))
+                        .children(focus_button),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -563,9 +578,9 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
                 .flex_col()
                 .gap(px(16.))
                 .w_full()
-                .max_w(px(720.))
+                .max_w(px(PAGE_MAX_W))
                 .mx_auto()
-                .px(px(32.))
+                .px(px(pad_x))
                 .pt(px(24.))
                 .pb(px(48.))
                 .child(

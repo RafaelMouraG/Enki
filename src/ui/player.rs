@@ -136,18 +136,16 @@ pub fn row(
                 .min_w_0()
                 .child(
                     div()
-                        .ellipsis()
                         .text_size(px(title_size))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(theme.text)
-                        .child(np.title.clone()),
+                        .ellipsis_child(np.title.clone()),
                 )
                 .child(
                     div()
-                        .ellipsis()
                         .text_size(px(artist_size))
                         .text_color(theme.text_muted)
-                        .child(np.artist.clone()),
+                        .ellipsis_child(np.artist.clone()),
                 ),
         )
         .child(

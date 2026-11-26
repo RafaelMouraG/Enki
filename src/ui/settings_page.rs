@@ -15,11 +15,14 @@ use crate::{
         components::StyledExt as _,
         components::{
             button, card, icon, icon_sized, keycap, page_title, section_label, setting_row, slider,
-            stepper, toggle, ButtonKind,
+            stepper, toggle, ButtonKind, SLIDER_WIDTH,
         },
+        content_viewport, page_padding_x,
         root::RootView,
     },
 };
+
+const PAGE_MAX_W: f32 = 760.;
 
 /// Click handler that edits settings.
 fn set(
@@ -68,6 +71,7 @@ const DIM_STOPS: Stops = Stops {
 fn stop_slider(
     stops: &'static Stops,
     current: u32,
+    slider_width: f32,
     apply: fn(&mut Settings, u32),
     model: &Entity<Enki>,
     window: &mut Window,
@@ -98,6 +102,7 @@ fn stop_slider(
             stops.id,
             stops.values.len(),
             ix,
+            slider_width,
             &theme,
             window,
             cx,
@@ -115,10 +120,16 @@ pub fn render(
     window: &mut Window,
     cx: &mut Context<RootView>,
 ) -> AnyElement {
+    let sidebar_open = view.model.read(cx).settings.sidebar_open;
+    let (avail_w, _) = content_viewport(window, sidebar_open);
+    let pad_x = page_padding_x(avail_w);
+    let inner_w = avail_w.min(PAGE_MAX_W) - 2. * pad_x;
+    let slider_w = if inner_w < 500. { 190. } else { SLIDER_WIDTH };
+
     let content: Vec<AnyElement> = match section {
         SettingsSection::General => general(view, window, cx),
-        SettingsSection::Appearance => appearance(view, window, cx),
-        SettingsSection::Timer => timer(view, window, cx),
+        SettingsSection::Appearance => appearance(view, slider_w, window, cx),
+        SettingsSection::Timer => timer(view, slider_w, window, cx),
         SettingsSection::Notifications => notifications(view, window, cx),
         SettingsSection::Shortcuts => shortcuts(cx),
     };
@@ -133,9 +144,9 @@ pub fn render(
                 .flex_col()
                 .gap(px(8.))
                 .w_full()
-                .max_w(px(760.))
+                .max_w(px(PAGE_MAX_W))
                 .mx_auto()
-                .px(px(32.))
+                .px(px(pad_x))
                 .pt(px(24.))
                 .pb(px(64.))
                 .child(page_title(theme, section.label()).pb(px(12.)))
@@ -334,6 +345,7 @@ fn scheme_tile(
         .items_center()
         .gap(px(10.))
         .flex_1()
+        .min_w(px(100.))
         .cursor_pointer()
         .child(preview)
         .child(
@@ -470,6 +482,7 @@ fn dropdown<T: Copy + PartialEq + 'static>(
 
 fn appearance(
     view: &mut RootView,
+    slider_w: f32,
     window: &mut Window,
     cx: &mut Context<RootView>,
 ) -> Vec<AnyElement> {
@@ -482,6 +495,7 @@ fn appearance(
 
     let schemes = div()
         .flex()
+        .flex_wrap()
         .gap(px(16.))
         .pb(px(12.))
         .child(scheme_tile(
@@ -524,7 +538,7 @@ fn appearance(
             .cursor_pointer()
             .child(div().size(px(22.)).rounded(px(6.)).bg(color))
     };
-    let mut swatches = div().flex().items_center().gap(px(4.));
+    let mut swatches = div().flex().flex_wrap().items_center().gap(px(4.));
     if let Some(wp) = &wallpaper {
         let tint: Hsla = wp.tint.into();
         swatches = swatches.child(
@@ -681,8 +695,10 @@ fn appearance(
     });
     let image_row = div()
         .flex()
+        .flex_wrap()
         .items_center()
-        .gap(px(14.))
+        .gap_x(px(14.))
+        .gap_y(px(10.))
         .px(px(16.))
         .py(px(12.))
         .border_t_1()
@@ -693,7 +709,7 @@ fn appearance(
                 .flex()
                 .flex_col()
                 .flex_1()
-                .min_w_0()
+                .min_w(px(140.))
                 .gap(px(2.))
                 .child(
                     div()
@@ -703,20 +719,27 @@ fn appearance(
                 )
                 .child(
                     div()
-                        .ellipsis()
                         .text_size(px(12.5))
                         .text_color(theme_ref.text_muted)
-                        .child(image_name.clone().unwrap_or_else(|| {
+                        .ellipsis_child(image_name.clone().unwrap_or_else(|| {
                             "Imagens (PNG, JPG, WebP, GIF, HEIC…) e vídeos (MP4, MOV, WebM).".into()
                         })),
                 ),
         )
-        .child(pick_btn)
-        .children(remove_btn);
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(8.))
+                .child(pick_btn)
+                .children(remove_btn),
+        );
 
     let dim = stop_slider(
         &DIM_STOPS,
         s.background_dim as u32,
+        slider_w,
         |s, v| s.background_dim = v as u8,
         &model,
         window,
@@ -786,12 +809,18 @@ fn appearance(
     ]
 }
 
-fn timer(view: &mut RootView, window: &mut Window, cx: &mut Context<RootView>) -> Vec<AnyElement> {
+fn timer(
+    view: &mut RootView,
+    slider_w: f32,
+    window: &mut Window,
+    cx: &mut Context<RootView>,
+) -> Vec<AnyElement> {
     let model = view.model.clone();
     let s = model.read(cx).settings.clone();
     let focus = stop_slider(
         &FOCUS_STOPS,
         s.focus_minutes,
+        slider_w,
         |s, v| s.focus_minutes = v,
         &model,
         window,
@@ -800,6 +829,7 @@ fn timer(view: &mut RootView, window: &mut Window, cx: &mut Context<RootView>) -
     let short = stop_slider(
         &SHORT_STOPS,
         s.short_break_minutes,
+        slider_w,
         |s, v| s.short_break_minutes = v,
         &model,
         window,
@@ -808,6 +838,7 @@ fn timer(view: &mut RootView, window: &mut Window, cx: &mut Context<RootView>) -
     let long = stop_slider(
         &LONG_STOPS,
         s.long_break_minutes,
+        slider_w,
         |s, v| s.long_break_minutes = v,
         &model,
         window,
@@ -816,6 +847,7 @@ fn timer(view: &mut RootView, window: &mut Window, cx: &mut Context<RootView>) -
     let every = stop_slider(
         &EVERY_STOPS,
         s.long_break_every,
+        slider_w,
         |s, v| s.long_break_every = v,
         &model,
         window,
@@ -827,7 +859,7 @@ fn timer(view: &mut RootView, window: &mut Window, cx: &mut Context<RootView>) -
         ("preset-deep", "Profundo", 50, 10, 20),
         ("preset-short", "Curto", 15, 3, 10),
     ];
-    let preset_row = div().flex().gap(px(12.)).pb(px(12.)).children(
+    let preset_row = div().flex().flex_wrap().gap(px(12.)).pb(px(12.)).children(
         presets.into_iter().map(|(id, name, f, sb, lb)| {
             let active =
                 s.focus_minutes == f && s.short_break_minutes == sb && s.long_break_minutes == lb;
@@ -838,6 +870,7 @@ fn timer(view: &mut RootView, window: &mut Window, cx: &mut Context<RootView>) -
                 .flex()
                 .flex_col()
                 .flex_1()
+                .min_w(px(120.))
                 .gap(px(4.))
                 .px(px(14.))
                 .py(px(12.))

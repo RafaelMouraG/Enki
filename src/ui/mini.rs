@@ -185,10 +185,9 @@ impl Render for MiniView {
                     )
                     .child(
                         div()
-                            .ellipsis()
                             .text_size(px(12.))
                             .text_color(theme.text_muted)
-                            .child(caption),
+                            .ellipsis_child(caption),
                     ),
             )
             .child(

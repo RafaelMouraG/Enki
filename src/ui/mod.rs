@@ -13,7 +13,32 @@ mod wrapped_page;
 
 use gpui::{App, ClickEvent, Context, Entity, Window};
 
-use crate::state::Enki;
+use crate::{state::Enki, theme::sidebar_width};
+
+/// Usable dimensions `(width, height)` of the main content area (excluding the
+/// sidebar when open and the title bar).
+pub fn content_viewport(window: &Window, sidebar_open: bool) -> (f32, f32) {
+    let vp = window.viewport_size();
+    let sidebar = if sidebar_open {
+        f32::from(sidebar_width())
+    } else {
+        0.
+    };
+    let w = (f32::from(vp.width) - sidebar).max(200.);
+    let h = (f32::from(vp.height) - root::TITLEBAR_HEIGHT).max(200.);
+    (w, h)
+}
+
+/// Responsive horizontal page padding for a given main-area width.
+pub fn page_padding_x(avail_w: f32) -> f32 {
+    if avail_w < 520. {
+        16.
+    } else if avail_w < 680. {
+        24.
+    } else {
+        32.
+    }
+}
 
 /// Click handler that runs `f` against the shared model.
 pub fn on_model(

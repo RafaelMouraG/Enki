@@ -16,23 +16,29 @@ use crate::{
             button, card, icon_sized, page_title, section_label, segmented, ButtonKind,
             SegmentOption, StyledExt as _,
         },
-        format_minutes, on_model,
+        format_minutes, on_model, page_padding_x, content_viewport,
         root::RootView,
     },
 };
 
+const PAGE_MAX_W: f32 = 820.;
+
 pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootView>) -> AnyElement {
     let model = view.model.clone();
     let theme = Theme::get(cx).clone();
-    let (wrapped, period, focus_only, tracking_enabled) = {
+    let (wrapped, period, focus_only, tracking_enabled, sidebar_open) = {
         let enki = model.read(cx);
         (
             enki.wrapped.clone(),
             enki.wrapped_period,
             enki.wrapped_focus_only,
             enki.settings.now_playing && enki.settings.track_music,
+            enki.settings.sidebar_open,
         )
     };
+    let (avail_w, _) = content_viewport(window, sidebar_open);
+    let pad_x = page_padding_x(avail_w);
+    let inner_w = avail_w.min(PAGE_MAX_W) - 2. * pad_x;
 
     let period_switcher = segmented(
         "wrapped-period",
@@ -149,27 +155,28 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
             )
             .into_any_element()]
     } else {
-        let hero = wrapped_hero(&wrapped, period, focus_only, &theme);
+        let hero = wrapped_hero(&wrapped, period, focus_only, inner_w, &theme);
 
+        let two_cols = inner_w >= 620.;
         let tracks_card = div()
             .flex()
             .flex_col()
-            .flex_1()
-            .min_w(px(320.))
+            .when(two_cols, |d| d.flex_1())
+            .min_w_0()
             .child(section_label(&theme, "Top músicas"))
             .child(top_tracks_card(&wrapped.top_tracks, &theme));
 
         let artists_card = div()
             .flex()
             .flex_col()
-            .flex_1()
-            .min_w(px(320.))
+            .when(two_cols, |d| d.flex_1())
+            .min_w_0()
             .child(section_label(&theme, "Top artistas"))
             .child(top_artists_card(&wrapped.top_artists, &theme));
 
         let rankings = div()
             .flex()
-            .flex_wrap()
+            .when(!two_cols, |d| d.flex_col())
             .gap(px(16.))
             .child(tracks_card)
             .child(artists_card)
@@ -210,9 +217,9 @@ pub fn render(view: &mut RootView, window: &mut Window, cx: &mut Context<RootVie
                 .flex_col()
                 .gap(px(16.))
                 .w_full()
-                .max_w(px(820.))
+                .max_w(px(PAGE_MAX_W))
                 .mx_auto()
-                .px(px(32.))
+                .px(px(pad_x))
                 .pt(px(24.))
                 .pb(px(48.))
                 .child(page_title(&theme, "Wrapped"))
@@ -226,6 +233,7 @@ fn wrapped_hero(
     wrapped: &MusicWrapped,
     period: WrappedPeriod,
     focus_only: bool,
+    inner_w: f32,
     theme: &Theme,
 ) -> AnyElement {
     let top_track = wrapped.top_tracks.first();
@@ -253,13 +261,14 @@ fn wrapped_hero(
         _ => String::new(),
     };
 
+    let compact = inner_w < 460.;
     let stat_chip = |label: &'static str, value: String| {
         div()
             .flex()
             .flex_col()
             .gap(px(2.))
             .flex_1()
-            .min_w(px(110.))
+            .min_w_0()
             .px(px(12.))
             .py(px(10.))
             .rounded(radius::MD)
@@ -273,17 +282,18 @@ fn wrapped_hero(
             ))
             .child(
                 div()
-                    .text_size(px(20.))
+                    .text_size(px(if compact { 18. } else { 20. }))
                     .font(tabular_font())
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme.text)
+                    .whitespace_nowrap()
                     .child(value),
             )
             .child(
                 div()
                     .text_size(px(12.))
                     .text_color(theme.text_muted)
-                    .child(label),
+                    .ellipsis_child(label),
             )
     };
 
@@ -293,14 +303,38 @@ fn wrapped_hero(
         format!("WRAPPED GERAL · {}", period.title().to_uppercase())
     };
 
+    let c_time = stat_chip("Tempo ouvindo", format_listen_time(wrapped.total_seconds));
+    let c_plays = stat_chip("Reproduções", wrapped.total_plays.to_string());
+    let c_artists = stat_chip("Artistas", wrapped.distinct_artists.to_string());
+    let c_tracks = stat_chip("Músicas", wrapped.distinct_tracks.to_string());
+
+    let stats_grid: AnyElement = if inner_w >= 560. {
+        div()
+            .flex()
+            .gap(px(10.))
+            .child(c_time)
+            .child(c_plays)
+            .child(c_artists)
+            .child(c_tracks)
+            .into_any_element()
+    } else {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .child(div().flex().gap(px(10.)).child(c_time).child(c_plays))
+            .child(div().flex().gap(px(10.)).child(c_artists).child(c_tracks))
+            .into_any_element()
+    };
+
     card("wrapped-hero", theme)
         .child(
             div()
                 .relative()
                 .flex()
                 .flex_col()
-                .gap(px(18.))
-                .p(px(20.))
+                .gap(px(if compact { 14. } else { 18. }))
+                .p(px(if compact { 16. } else { 20. }))
                 .bg(linear_gradient(
                     135.,
                     linear_color_stop(with_alpha(theme.accent, 0.22), 0.),
@@ -310,8 +344,13 @@ fn wrapped_hero(
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(16.))
-                        .child(album_thumb(hero_art, 76., radius::LG, theme))
+                        .gap(px(if compact { 12. } else { 16. }))
+                        .child(album_thumb(
+                            hero_art,
+                            if compact { 56. } else { 76. },
+                            radius::LG,
+                            theme,
+                        ))
                         .child(
                             div()
                                 .flex()
@@ -324,38 +363,24 @@ fn wrapped_hero(
                                         .text_size(px(11.))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(theme.accent_text)
-                                        .child(badge),
+                                        .ellipsis_child(badge),
                                 )
                                 .child(
                                     div()
-                                        .ellipsis()
-                                        .text_size(px(26.))
+                                        .text_size(px(if compact { 21. } else { 26. }))
                                         .font_weight(FontWeight::BOLD)
                                         .text_color(theme.text)
-                                        .child(headline),
+                                        .ellipsis_child(headline),
                                 )
                                 .child(
                                     div()
-                                        .ellipsis()
                                         .text_size(px(13.5))
                                         .text_color(theme.text_muted)
-                                        .child(subline),
+                                        .ellipsis_child(subline),
                                 ),
                         ),
                 )
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap(px(10.))
-                        .child(stat_chip(
-                            "Tempo ouvindo",
-                            format_listen_time(wrapped.total_seconds),
-                        ))
-                        .child(stat_chip("Reproduções", wrapped.total_plays.to_string()))
-                        .child(stat_chip("Artistas", wrapped.distinct_artists.to_string()))
-                        .child(stat_chip("Músicas", wrapped.distinct_tracks.to_string())),
-                ),
+                .child(stats_grid),
         )
         .into_any_element()
 }
@@ -393,18 +418,16 @@ fn top_tracks_card(tracks: &[TopTrack], theme: &Theme) -> AnyElement {
                                 .min_w_0()
                                 .child(
                                     div()
-                                        .ellipsis()
                                         .text_size(px(13.5))
                                         .font_weight(FontWeight::MEDIUM)
                                         .text_color(theme.text)
-                                        .child(track.title.clone()),
+                                        .ellipsis_child(track.title.clone()),
                                 )
                                 .child(
                                     div()
-                                        .ellipsis()
                                         .text_size(px(12.))
                                         .text_color(theme.text_muted)
-                                        .child(if track.artist.is_empty() {
+                                        .ellipsis_child(if track.artist.is_empty() {
                                             "Artista desconhecido".to_string()
                                         } else {
                                             track.artist.clone()
@@ -486,11 +509,10 @@ fn top_artists_card(artists: &[TopArtist], theme: &Theme) -> AnyElement {
                                 .min_w_0()
                                 .child(
                                     div()
-                                        .ellipsis()
                                         .text_size(px(13.5))
                                         .font_weight(FontWeight::MEDIUM)
                                         .text_color(theme.text)
-                                        .child(artist.artist.clone()),
+                                        .ellipsis_child(artist.artist.clone()),
                                 )
                                 .child(
                                     div()

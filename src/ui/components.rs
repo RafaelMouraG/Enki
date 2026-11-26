@@ -1,12 +1,17 @@
 //! Small themed building blocks shared by every page.
 
-use std::{cell::Cell, rc::Rc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    time::Duration,
+};
 
 use gpui::{
     canvas, div, linear_color_stop, linear_gradient, point, prelude::*, px, svg, Animation,
-    AnimationExt as _, AnyElement, App, BoxShadow, ClickEvent, CursorStyle, DispatchPhase, Div,
-    ElementId, FontWeight, HitboxBehavior, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, SharedString, Svg, Window,
+    AnimationExt as _, AnyElement, App, AvailableSpace, Bounds, BoxShadow, ClickEvent, ContentMask,
+    CursorStyle, DispatchPhase, Div, Element, ElementId, FontWeight, GlobalElementId,
+    HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, ShapedLine, SharedString, Size, Svg, TextStyle, Window,
 };
 
 use crate::{
@@ -208,16 +213,215 @@ pub fn liquid_highlights(radius: Pixels, is_dark: bool, base: f32, t: f32) -> An
         .into_any_element()
 }
 
-/// Single-line text with an ellipsis. GPUI's own `truncate()` caches the
-/// unconstrained width when combined with `nowrap` and never truncates, while
-/// a one-line clamp is re-measured against the real width.
-pub trait StyledExt: Styled + Sized {
-    fn ellipsis(self) -> Self {
-        self.overflow_hidden().line_clamp(1).text_ellipsis()
+/// Single-line text that truncates with `"…"` to fit its laid-out width.
+///
+/// Works around a bug in GPUI 0.2.2's `TextLayout::layout`, where
+/// `LineWrapper::truncate_line` mutates the captured `Vec<TextRun>` in place
+/// across repeated Taffy flexbox measurement passes — causing
+/// `MacTextSystem::layout_line` to slice mid-codepoint and panic on multi-byte
+/// UTF-8 strings (e.g. accented, fullwidth, or emoji track titles).
+pub struct EllipsisText {
+    text: SharedString,
+}
+
+pub fn ellipsis_text(text: impl Into<SharedString>) -> EllipsisText {
+    let raw: SharedString = text.into();
+    let text = if raw.contains(['\n', '\r']) {
+        SharedString::from(raw.replace(['\r', '\n'], " "))
+    } else {
+        raw
+    };
+    EllipsisText { text }
+}
+
+fn shape_ellipsis_line(
+    text: &SharedString,
+    max_width: Option<Pixels>,
+    text_style: &TextStyle,
+    font_size: Pixels,
+    window: &mut Window,
+    cx: &mut App,
+) -> ShapedLine {
+    if text.is_empty() {
+        return ShapedLine::default();
+    }
+    let display_text = match max_width {
+        Some(width) if width <= px(0.) => SharedString::default(),
+        Some(width) => {
+            let mut line_wrapper = cx.text_system().line_wrapper(text_style.font(), font_size);
+            // Fresh single run every pass so repeated Taffy measurements never corrupt run lengths.
+            let mut scratch_runs = vec![text_style.to_run(text.len())];
+            line_wrapper.truncate_line(text.clone(), width, "…", &mut scratch_runs)
+        }
+        None => text.clone(),
+    };
+    if display_text.is_empty() {
+        return ShapedLine::default();
+    }
+    let run = text_style.to_run(display_text.len());
+    window
+        .text_system()
+        .shape_line(display_text, font_size, &[run], None)
+}
+
+struct EllipsisCache {
+    max_width: Option<Pixels>,
+    line: ShapedLine,
+}
+
+type EllipsisState = Rc<RefCell<Option<EllipsisCache>>>;
+
+pub struct EllipsisTextLayout {
+    text_style: TextStyle,
+    font_size: Pixels,
+    line_height: Pixels,
+    state: EllipsisState,
+}
+
+impl Element for EllipsisText {
+    type RequestLayoutState = EllipsisTextLayout;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let text_style = window.text_style();
+        let font_size = text_style.font_size.to_pixels(window.rem_size());
+        let line_height = text_style
+            .line_height
+            .to_pixels(font_size.into(), window.rem_size());
+        let state: EllipsisState = Rc::new(RefCell::new(None));
+
+        let layout_id = window.request_measured_layout(Default::default(), {
+            let text = self.text.clone();
+            let text_style = text_style.clone();
+            let state = state.clone();
+            move |known_dimensions, available_space, window, cx| {
+                let max_width = known_dimensions.width.or(match available_space.width {
+                    AvailableSpace::Definite(w) => Some(w),
+                    AvailableSpace::MinContent => {
+                        return Size {
+                            width: px(0.),
+                            height: line_height,
+                        };
+                    }
+                    AvailableSpace::MaxContent => None,
+                });
+                let line = shape_ellipsis_line(&text, max_width, &text_style, font_size, window, cx);
+                let width = match max_width {
+                    Some(w) => line.width.min(w).ceil(),
+                    None => line.width.ceil(),
+                };
+                *state.borrow_mut() = Some(EllipsisCache { max_width, line });
+                Size {
+                    width,
+                    height: line_height,
+                }
+            }
+        });
+
+        (
+            layout_id,
+            EllipsisTextLayout {
+                text_style,
+                font_size,
+                line_height,
+                state,
+            },
+        )
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        layout_state: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let needs_reshape = {
+            let guard = layout_state.state.borrow();
+            match guard.as_ref() {
+                Some(EllipsisCache {
+                    max_width: Some(w), ..
+                }) if (*w - bounds.size.width).abs() < px(0.5) => false,
+                Some(EllipsisCache {
+                    max_width: None,
+                    line,
+                }) if line.width <= bounds.size.width + px(0.5) => false,
+                _ => true,
+            }
+        };
+        if needs_reshape {
+            // 0.5px slack avoids ellipsizing a line whose measured width rounded up to bounds.
+            let line = shape_ellipsis_line(
+                &self.text,
+                Some(bounds.size.width + px(0.5)),
+                &layout_state.text_style,
+                layout_state.font_size,
+                window,
+                cx,
+            );
+            *layout_state.state.borrow_mut() = Some(EllipsisCache {
+                max_width: Some(bounds.size.width),
+                line,
+            });
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        layout_state: &mut Self::RequestLayoutState,
+        _: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(cache) = layout_state.state.borrow().as_ref() {
+            let clip = bounds.intersect(&window.content_mask().bounds);
+            if clip.size.width > px(0.) && clip.size.height > px(0.) {
+                window.with_content_mask(Some(ContentMask { bounds: clip }), |window| {
+                    let _ = cache
+                        .line
+                        .paint(bounds.origin, layout_state.line_height, window, cx);
+                });
+            }
+        }
     }
 }
 
-impl<T: Styled> StyledExt for T {}
+impl IntoElement for EllipsisText {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+/// Single-line text with an ellipsis (`"…"`), safe across multi-pass flexbox
+/// layout and multi-byte UTF-8 text.
+pub trait StyledExt: Styled + ParentElement + Sized {
+    fn ellipsis_child(self, text: impl Into<SharedString>) -> Self {
+        self.overflow_hidden().child(ellipsis_text(text))
+    }
+}
+
+impl<T: Styled + ParentElement> StyledExt for T {}
 
 pub trait SurfaceExt: Styled + ParentElement + Sized {
     /// A card surface: glass in the liquid style, a filled panel otherwise.
@@ -626,7 +830,8 @@ pub fn card(key: impl Into<SharedString>, theme: &Theme) -> Div {
         .relative()
         .flex()
         .flex_col()
-        .w_full()
+        .flex_shrink_0()
+        .min_w_0()
         .rounded(radius::LG)
         .surface(key, radius::LG, theme)
         .overflow_hidden()
@@ -642,9 +847,11 @@ pub fn setting_row(
 ) -> Div {
     div()
         .flex()
+        .flex_wrap()
         .items_center()
         .justify_between()
-        .gap(px(16.))
+        .gap_x(px(16.))
+        .gap_y(px(10.))
         .px(px(16.))
         .py(px(12.))
         .min_h(px(56.))
@@ -655,7 +862,7 @@ pub fn setting_row(
                 .flex_col()
                 .gap(px(2.))
                 .flex_1()
-                .min_w_0()
+                .min_w(px(150.))
                 .child(
                     div()
                         .text_size(px(14.))
@@ -676,6 +883,7 @@ pub fn setting_row(
             div()
                 .flex()
                 .flex_none()
+                .max_w_full()
                 .items_center()
                 .gap(px(8.))
                 .child(control),
@@ -774,6 +982,7 @@ pub fn segmented(
                 .id(seg_id)
                 .relative()
                 .flex()
+                .flex_none()
                 .items_center()
                 .gap(px(6.))
                 .h(px(28.))
@@ -781,6 +990,7 @@ pub fn segmented(
                 .rounded_full()
                 .text_size(px(13.))
                 .font_weight(FontWeight::MEDIUM)
+                .whitespace_nowrap()
                 .cursor_pointer()
                 .bg(selected_bg)
                 .text_color(text)
@@ -801,7 +1011,8 @@ pub fn segmented(
                     .px(px(14.))
                     .rounded_full()
                     .text_size(px(13.))
-                    .font_weight(FontWeight::MEDIUM),
+                    .font_weight(FontWeight::MEDIUM)
+                    .whitespace_nowrap(),
                 210,
                 ease_out_cubic,
                 move |d, t| {
@@ -818,6 +1029,7 @@ pub fn segmented(
             );
             div()
                 .id(seg_id)
+                .flex_none()
                 .h(px(28.))
                 .rounded_full()
                 .cursor_pointer()
@@ -835,6 +1047,8 @@ pub fn segmented(
     div()
         .relative()
         .flex()
+        .flex_none()
+        .max_w_full()
         .items_center()
         .gap(px(2.))
         .p(px(3.))
@@ -889,22 +1103,25 @@ struct SliderDrag {
     last: usize,
 }
 
-const SLIDER_WIDTH: f32 = 260.;
+pub const SLIDER_WIDTH: f32 = 260.;
 const SLIDER_HEIGHT: f32 = 26.;
 const KNOB_WIDTH: f32 = 38.;
 
 /// A track with a dot per stop and a capsule knob, like macOS's effort
 /// slider. Dragging snaps to the stops with a trackpad tick at each one.
+#[allow(clippy::too_many_arguments)]
 pub fn slider(
     id: impl Into<SharedString>,
     stops: usize,
     value: usize,
+    width: f32,
     theme: &Theme,
     window: &mut Window,
     cx: &mut App,
     on_change: impl Fn(usize, &mut App) + 'static,
 ) -> AnyElement {
     let id: SharedString = id.into();
+    let width = width.max(KNOB_WIDTH + 24.);
     let stops = stops.max(2);
     let value = value.min(stops - 1);
     let state = window.use_keyed_state(ElementId::Name(format!("{id}-drag").into()), cx, |_, _| {
@@ -913,7 +1130,7 @@ pub fn slider(
     let on_change = Rc::new(on_change);
 
     let pad = KNOB_WIDTH / 2.;
-    let span = SLIDER_WIDTH - KNOB_WIDTH;
+    let span = width - KNOB_WIDTH;
     let x_of = move |ix: usize| pad + span * ix as f32 / (stops - 1) as f32;
     let (track, dot_off, dot_on) = if theme.is_dark {
         (
@@ -992,7 +1209,7 @@ pub fn slider(
         .id(id)
         .relative()
         .flex_none()
-        .w(px(SLIDER_WIDTH))
+        .w(px(width))
         .h(px(SLIDER_HEIGHT))
         .rounded_full()
         .bg(track)
@@ -1033,4 +1250,19 @@ pub fn slider(
         )
         .child(interaction)
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ellipsis_text_flattens_newlines_and_preserves_multibyte_unicode() {
+        let single = ellipsis_text("Linha 1\nLinha 2\r\nLinha 3");
+        assert_eq!(single.text.as_ref(), "Linha 1 Linha 2  Linha 3");
+
+        let morse = "－･･ ･－ －･ －･－･ ･ －－ ･ － －－－ － ････ ･ ･ －･ －･･ －－－ ･･－･ ･－･･ －－－ ･･･－ ･";
+        let el = ellipsis_text(morse);
+        assert_eq!(el.text.as_ref(), morse);
+    }
 }

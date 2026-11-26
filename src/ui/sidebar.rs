@@ -163,7 +163,7 @@ fn nav_item(
             .on_click(on_click)
             .child(liquid_highlights(px(17.), is_dark, 0.75, 0.0))
             .child(div().relative().child(icon(glyph).text_color(text)))
-            .child(div().relative().flex_1().min_w_0().ellipsis().child(label))
+            .child(div().relative().flex_1().min_w_0().ellipsis_child(label))
             .when_some(trailing, |d, t| {
                 d.child(
                     div()
@@ -206,8 +206,7 @@ fn nav_item(
                         .relative()
                         .flex_1()
                         .min_w_0()
-                        .ellipsis()
-                        .child(label.clone()),
+                        .ellipsis_child(label.clone()),
                 )
                 .when_some(trailing.clone(), |d, trail| {
                     d.child(
@@ -355,7 +354,7 @@ fn main_nav(view: &mut RootView, window: &mut Window, cx: &mut Context<RootView>
                         m.set_current_task(next, cx);
                     }))
                     .child(div().size(px(6.)).rounded_full().flex_none().bg(accent))
-                    .child(div().flex_1().min_w_0().ellipsis().text_color(text).child(title))
+                    .child(div().flex_1().min_w_0().text_color(text).ellipsis_child(title))
                     .child(
                         div()
                             .text_size(px(12.))
@@ -390,9 +389,8 @@ fn main_nav(view: &mut RootView, window: &mut Window, cx: &mut Context<RootView>
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .ellipsis()
                                     .text_color(mix_hsla(muted, text, tc))
-                                    .child(title.clone()),
+                                    .ellipsis_child(title.clone()),
                             )
                             .child(
                                 div()
@@ -509,11 +507,11 @@ fn main_nav(view: &mut RootView, window: &mut Window, cx: &mut Context<RootView>
         .child(
             div()
                 .flex_1()
-                .ellipsis()
+                .min_w_0()
                 .text_size(px(13.5))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(theme.text)
-                .child(format!("{} de {goal} hoje", today.pomodoros)),
+                .ellipsis_child(format!("{} de {goal} hoje", today.pomodoros)),
         )
         .child(footer_mini)
         .child(footer_settings);

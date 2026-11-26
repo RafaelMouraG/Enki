@@ -87,12 +87,12 @@ mod mac {
     };
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use std::{
-        cell::RefCell,
+        cell::{Cell, RefCell},
         collections::{HashMap, HashSet},
         ffi::{c_void, CString},
         path::PathBuf,
         sync::OnceLock,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     type Id = *mut Object;
@@ -147,9 +147,7 @@ mod mac {
     }
 
     #[link(name = "QuartzCore", kind = "framework")]
-    extern "C" {
-        static kCAAnimationDiscrete: Id;
-    }
+    extern "C" {}
 
     #[link(name = "CoreImage", kind = "framework")]
     extern "C" {}
@@ -157,10 +155,27 @@ mod mac {
     #[link(name = "CoreMedia", kind = "framework")]
     extern "C" {}
 
+    type CFRunLoopTimerCallBack = extern "C" fn(timer: *const c_void, info: *mut c_void);
+
     #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
+        static kCFRunLoopCommonModes: *const c_void;
         fn CFRelease(cf: *const c_void);
         fn CFDataCreate(allocator: *const c_void, bytes: *const u8, length: isize) -> *const c_void;
+        fn CFAbsoluteTimeGetCurrent() -> f64;
+        fn CFRunLoopGetMain() -> *const c_void;
+        fn CFRunLoopAddTimer(rl: *const c_void, timer: *const c_void, mode: *const c_void);
+        fn CFRunLoopTimerCreate(
+            allocator: *const c_void,
+            fire_date: f64,
+            interval: f64,
+            flags: usize,
+            order: isize,
+            callout: CFRunLoopTimerCallBack,
+            context: *const c_void,
+        ) -> *const c_void;
+        fn CFRunLoopTimerSetNextFireDate(timer: *const c_void, fire_date: f64);
+        fn CFRunLoopTimerInvalidate(timer: *const c_void);
     }
 
     #[link(name = "CoreGraphics", kind = "framework")]
@@ -201,6 +216,9 @@ mod mac {
     const NS_WINDOW_BELOW: isize = -1;
     const NS_VIEW_WIDTH_SIZABLE: usize = 2;
     const NS_VIEW_HEIGHT_SIZABLE: usize = 16;
+    const NS_WINDOW_OCCLUSION_VISIBLE: usize = 1 << 1;
+    /// Large non-zero interval so `CFRunLoopTimer` stays repeating instead of auto-invalidating.
+    const ANIM_TIMER_REPEAT_INTERVAL: f64 = 365.0 * 86400.0;
     /// `kCGImageByteOrder32Little | kCGImageAlphaPremultipliedFirst` (BGRA premultiplied).
     const BITMAP_BGRA_PREMULTIPLIED: u32 = (2 << 12) | 2;
     /// `kCGImageAlphaNoneSkipLast` (big-endian RGBX).
@@ -336,6 +354,15 @@ mod mac {
         Video(PathBuf),
     }
 
+    struct AnimatedBackdrop {
+        view: Id,
+        layer: Id,
+        frames: Vec<*const c_void>,
+        delays: Vec<Duration>,
+        current: usize,
+        next_frame_at: Instant,
+    }
+
     struct VideoBackdrop {
         clip_view: Id,
         video_view: Id,
@@ -356,6 +383,7 @@ mod mac {
         parent: Id,
         color_view: Option<Id>,
         image_view: Option<Id>,
+        animated: Option<AnimatedBackdrop>,
         video: Option<VideoBackdrop>,
         dim_view: Option<Id>,
         color: Option<Hsla>,
@@ -371,6 +399,7 @@ mod mac {
                 parent: NIL,
                 color_view: None,
                 image_view: None,
+                animated: None,
                 video: None,
                 dim_view: None,
                 color: None,
@@ -385,6 +414,8 @@ mod mac {
     thread_local! {
         /// Keyed by GPUI's NSView, one per window.
         static HOSTS: RefCell<HashMap<usize, Host>> = RefCell::new(HashMap::new());
+        /// Shared main-runloop timer advancing animated GIF/WebP backdrops.
+        static ANIM_TIMER: Cell<*const c_void> = const { Cell::new(std::ptr::null()) };
     }
 
     fn gpui_view(window: &Window) -> Option<Id> {
@@ -437,6 +468,14 @@ mod mac {
         if let Some(view) = host.image_view.take() {
             remove(view);
         }
+        if let Some(anim) = host.animated.take() {
+            let _: () = msg_send![anim.layer, setContents: NIL];
+            let _: () = msg_send![anim.layer, release];
+            for cg in anim.frames {
+                CGImageRelease(cg);
+            }
+            remove(anim.view);
+        }
         if let Some(video) = host.video.take() {
             let _: () = msg_send![video.player, pause];
             let _: () = msg_send![video.looper, disableLooping];
@@ -451,6 +490,118 @@ mod mac {
         }
         host.dim = None;
         host.media_key = None;
+    }
+
+    unsafe fn ensure_anim_timer(delay: Duration) {
+        let fire_date = CFAbsoluteTimeGetCurrent() + delay.as_secs_f64().max(0.01);
+        let existing = ANIM_TIMER.with(Cell::get);
+        if existing.is_null() {
+            let timer = CFRunLoopTimerCreate(
+                std::ptr::null(),
+                fire_date,
+                ANIM_TIMER_REPEAT_INTERVAL,
+                0,
+                0,
+                anim_timer_callback,
+                std::ptr::null(),
+            );
+            if !timer.is_null() {
+                CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopCommonModes);
+                ANIM_TIMER.with(|cell| cell.set(timer));
+            }
+        } else {
+            CFRunLoopTimerSetNextFireDate(existing, fire_date);
+        }
+    }
+
+    unsafe fn stop_anim_timer() {
+        let timer = ANIM_TIMER.with(|cell| cell.replace(std::ptr::null()));
+        if !timer.is_null() {
+            CFRunLoopTimerInvalidate(timer);
+            CFRelease(timer);
+        }
+    }
+
+    fn sync_anim_timer(hosts: &HashMap<usize, Host>, reschedule_existing: bool) {
+        let now = Instant::now();
+        let min_wait = hosts
+            .values()
+            .filter_map(|h| h.animated.as_ref())
+            .filter(|a| a.frames.len() > 1)
+            .map(|a| a.next_frame_at.saturating_duration_since(now))
+            .min();
+        unsafe {
+            match min_wait {
+                Some(wait) => {
+                    if reschedule_existing || ANIM_TIMER.with(Cell::get).is_null() {
+                        ensure_anim_timer(wait);
+                    }
+                }
+                None => stop_anim_timer(),
+            }
+        }
+    }
+
+    unsafe fn tick_animated_backdrop(anim: &mut AnimatedBackdrop, now: Instant) -> Duration {
+        let window: Id = msg_send![anim.view, window];
+        let visible = if window.is_null() {
+            false
+        } else {
+            let is_vis: BOOL = msg_send![window, isVisible];
+            let is_mini: BOOL = msg_send![window, isMiniaturized];
+            let occ: usize = msg_send![window, occlusionState];
+            is_vis == YES && is_mini == NO && (occ & NS_WINDOW_OCCLUSION_VISIBLE) != 0
+        };
+        if !visible {
+            // Pause GPU uploads while hidden, minimized or occluded, and resume immediately when visible.
+            anim.next_frame_at = now;
+            return Duration::from_millis(250);
+        }
+        if now >= anim.next_frame_at {
+            anim.current = (anim.current + 1) % anim.frames.len();
+            let delay = anim.delays[anim.current];
+            anim.next_frame_at = now + delay;
+            let _: () = msg_send![class!(CATransaction), begin];
+            let _: () = msg_send![class!(CATransaction), setDisableActions: YES];
+            let _: () = msg_send![anim.layer, setContents: anim.frames[anim.current]];
+            let _: () = msg_send![class!(CATransaction), commit];
+            delay
+        } else {
+            anim.next_frame_at.saturating_duration_since(now)
+        }
+    }
+
+    extern "C" fn anim_timer_callback(_timer: *const c_void, _info: *mut c_void) {
+        autoreleasepool(|| {
+            let next_wait = HOSTS.with(|cell| match cell.try_borrow_mut() {
+                Ok(mut hosts) => {
+                    let now = Instant::now();
+                    let mut min_wait: Option<Duration> = None;
+                    for host in hosts.values_mut() {
+                        let Some(anim) = host.animated.as_mut() else {
+                            continue;
+                        };
+                        if anim.frames.len() <= 1 {
+                            continue;
+                        }
+                        let wait = unsafe { tick_animated_backdrop(anim, now) };
+                        min_wait = Some(match min_wait {
+                            Some(prev) => prev.min(wait),
+                            None => wait,
+                        });
+                    }
+                    min_wait
+                }
+                // Currently inside a synchronous GPUI frame; retry on the next tick.
+                Err(_) => Some(Duration::from_millis(16)),
+            });
+            unsafe {
+                match next_wait {
+                    Some(wait) => ensure_anim_timer(wait),
+                    None => stop_anim_timer(),
+                }
+            }
+        });
     }
 
     /// Starts a frame. `glass_enabled` controls Liquid Glass surfaces; `backdrop`
@@ -473,6 +624,7 @@ mod mac {
                     unsafe { teardown(host) };
                 }
                 if !need_host {
+                    sync_anim_timer(hosts, true);
                     return;
                 }
             }
@@ -486,9 +638,10 @@ mod mac {
                     unsafe { remove(surface.view) };
                 }
             }
-            if let Some(backdrop) = backdrop {
-                unsafe { sync_backdrop(host, gpui, &backdrop) };
+            let media_changed = if let Some(backdrop) = backdrop {
+                unsafe { sync_backdrop(host, gpui, &backdrop) }
             } else {
+                let had_anim = host.animated.is_some();
                 unsafe {
                     teardown_media(host);
                     if let Some(view) = host.color_view.take() {
@@ -496,7 +649,9 @@ mod mac {
                     }
                     host.color = None;
                 }
-            }
+                had_anim
+            };
+            sync_anim_timer(hosts, media_changed);
         });
     }
 
@@ -510,7 +665,7 @@ mod mac {
         }
     }
 
-    unsafe fn sync_backdrop(host: &mut Host, gpui: Id, backdrop: &Backdrop) {
+    unsafe fn sync_backdrop(host: &mut Host, gpui: Id, backdrop: &Backdrop) -> bool {
         let color_view = *host.color_view.get_or_insert_with(|| fill_view(gpui));
         if host.color != Some(backdrop.color) {
             set_layer_color(color_view, backdrop.color);
@@ -523,7 +678,8 @@ mod mac {
             BackdropMedia::Video { path, .. } => MediaKey::Video(path.to_path_buf()),
         });
 
-        if host.media_key != desired_key {
+        let media_changed = host.media_key != desired_key;
+        if media_changed {
             teardown_media(host);
             match &backdrop.media {
                 Some(BackdropMedia::Image(path)) => {
@@ -557,6 +713,7 @@ mod mac {
                 host.dim = Some(backdrop.dim);
             }
         }
+        media_changed
     }
 
     unsafe fn install_static_image(host: &mut Host, gpui: Id, path: &Path) {
@@ -632,58 +789,55 @@ mod mac {
             return;
         }
         let mut cg_images: Vec<*const c_void> = Vec::with_capacity(count);
-        let mut delays_ms: Vec<f64> = Vec::with_capacity(count);
+        let mut delays: Vec<Duration> = Vec::with_capacity(count);
         for i in 0..count {
             let cg = cgimage_from_frame(render_image, i);
             if !cg.is_null() {
                 cg_images.push(cg);
-                let ms = Duration::from(render_image.delay(i)).as_secs_f64() * 1000.0;
-                delays_ms.push(if ms <= 0.0 { 100.0 } else { ms });
+                let d = Duration::from(render_image.delay(i));
+                delays.push(if d.is_zero() {
+                    Duration::from_millis(100)
+                } else {
+                    d.max(Duration::from_millis(20))
+                });
             }
         }
         if cg_images.is_empty() {
             return;
         }
 
-        let view = fill_view(gpui);
-        let layer: Id = msg_send![view, layer];
+        // Use a dedicated layer-hosting NSView (`setLayer:` before `setWantsLayer:YES`)
+        // and advance `layer.contents` via a main-runloop timer instead of a
+        // `CAKeyframeAnimation`: AppKit never resets a hosted layer's contents,
+        // `WindowServer` only holds one active texture at a time, and playback
+        // resumes reliably after sleep, occlusion, space switches, and resize.
+        let parent: Id = msg_send![gpui, superview];
+        let frame = bounds_of(parent);
+        let layer: Id = msg_send![class!(CALayer), layer];
+        let _: () = msg_send![layer, setFrame: frame];
         let _: () = msg_send![layer, setContents: cg_images[0]];
         let _: () = msg_send![layer, setContentsGravity: nsstring("resizeAspectFill")];
         let _: () = msg_send![layer, setMasksToBounds: YES];
+        let _: Id = msg_send![layer, retain];
 
-        if cg_images.len() > 1 {
-            let values: Id = msg_send![class!(NSMutableArray), arrayWithCapacity: cg_images.len()];
-            let key_times: Id =
-                msg_send![class!(NSMutableArray), arrayWithCapacity: cg_images.len() + 1];
-            let total_ms: f64 = delays_ms.iter().sum::<f64>().max(1.0);
-            let mut acc = 0.0f64;
+        let view: Id = msg_send![class!(NSView), alloc];
+        let view: Id = msg_send![view, initWithFrame: frame];
+        let _: () =
+            msg_send![view, setAutoresizingMask: NS_VIEW_WIDTH_SIZABLE | NS_VIEW_HEIGHT_SIZABLE];
+        let _: () = msg_send![view, setLayer: layer];
+        let _: () = msg_send![view, setWantsLayer: YES];
+        let _: () =
+            msg_send![parent, addSubview: view positioned: NS_WINDOW_BELOW relativeTo: gpui];
 
-            let zero: Id = msg_send![class!(NSNumber), numberWithDouble: 0.0f64];
-            let _: () = msg_send![key_times, addObject: zero];
-            for (&cg, &ms) in cg_images.iter().zip(delays_ms.iter()) {
-                let _: () = msg_send![values, addObject: cg];
-                acc += ms;
-                let frac: Id =
-                    msg_send![class!(NSNumber), numberWithDouble: (acc / total_ms).min(1.0)];
-                let _: () = msg_send![key_times, addObject: frac];
-            }
-
-            let anim: Id =
-                msg_send![class!(CAKeyframeAnimation), animationWithKeyPath: nsstring("contents")];
-            let _: () = msg_send![anim, setValues: values];
-            let _: () = msg_send![anim, setKeyTimes: key_times];
-            let _: () = msg_send![anim, setDuration: total_ms / 1000.0];
-            let _: () = msg_send![anim, setCalculationMode: kCAAnimationDiscrete];
-            let _: () = msg_send![anim, setRepeatCount: f32::INFINITY];
-            let _: () = msg_send![anim, setRemovedOnCompletion: NO];
-            let _: () = msg_send![layer, addAnimation: anim forKey: nsstring("enkiWallpaperAnim")];
-        }
-
-        for cg in cg_images {
-            CGImageRelease(cg);
-        }
-
-        host.image_view = Some(view);
+        let first_delay = delays[0];
+        host.animated = Some(AnimatedBackdrop {
+            view,
+            layer,
+            frames: cg_images,
+            delays,
+            current: 0,
+            next_frame_at: Instant::now() + first_delay,
+        });
         host.dim_view = Some(fill_view(gpui));
     }
 
@@ -879,6 +1033,7 @@ mod mac {
         HOSTS.with_borrow_mut(|hosts| {
             if let Some(host) = hosts.remove(&(gpui as usize)) {
                 unsafe { teardown(host) };
+                sync_anim_timer(hosts, true);
             }
         });
     }

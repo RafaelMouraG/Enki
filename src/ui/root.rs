@@ -464,7 +464,7 @@ impl RootView {
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(theme.text)
             .child(icon(glyph).text_color(theme.accent))
-            .child(div().ellipsis().child(title))
+            .child(div().min_w_0().ellipsis_child(title))
             .into_any_element()
     }
 
